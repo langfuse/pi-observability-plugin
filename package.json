@@ -1,0 +1,51 @@
+{
+  "name": "@langfuse/pi-observability-plugin",
+  "version": "0.0.1",
+  "description": "Langfuse observability extension for the pi coding agent — traces prompts, agent turns, model generations, and tool calls to Langfuse.",
+  "license": "MIT",
+  "author": "Langfuse",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/langfuse/pi-observability-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/langfuse/pi-observability-plugin/issues"
+  },
+  "homepage": "https://github.com/langfuse/pi-observability-plugin#readme",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "langfuse",
+    "observability",
+    "tracing",
+    "opentelemetry"
+  ],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@langfuse/otel": "^5.10.0",
+    "@langfuse/tracing": "^5.10.0",
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/sdk-trace-node": "^2.10.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.83.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  }
+}
