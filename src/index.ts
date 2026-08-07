@@ -26,13 +26,40 @@ const MAX_CHARS = Number(process.env.PI_LANGFUSE_MAX_CHARS ?? "20000");
 // Config
 // ---------------------------------------------------------------------------
 
-interface LangfuseConfig {
+export interface LangfuseConfig {
   publicKey: string;
   secretKey: string;
   baseUrl: string;
   userId?: string;
   environment?: string;
   release?: string;
+}
+
+export function loadConfig(): LangfuseConfig | undefined {
+  // Kill switch: wins over both env keys and the config file.
+  if ((process.env.LANGFUSE_TRACING_ENABLED ?? "").trim().toLowerCase() === "false") {
+    return undefined;
+  }
+  const file = readConfigFile();
+  const asTrimmedString = (v: unknown): string | undefined =>
+    typeof v === "string" && v.trim() ? v.trim() : undefined;
+
+  const publicKey = process.env.LANGFUSE_PUBLIC_KEY?.trim() || asTrimmedString(file.publicKey);
+  const secretKey = process.env.LANGFUSE_SECRET_KEY?.trim() || asTrimmedString(file.secretKey);
+  if (!publicKey || !secretKey) return undefined;
+  const baseUrl =
+    process.env.LANGFUSE_BASE_URL?.trim() ||
+    process.env.LANGFUSE_HOST?.trim() ||
+    asTrimmedString(file.baseUrl) ||
+    "https://cloud.langfuse.com";
+  return {
+    publicKey,
+    secretKey,
+    baseUrl: baseUrl.replace(/\/$/, ""),
+    userId: process.env.LANGFUSE_USER_ID?.trim() || asTrimmedString(file.userId),
+    environment: process.env.LANGFUSE_TRACING_ENVIRONMENT?.trim() || asTrimmedString(file.environment),
+    release: process.env.LANGFUSE_RELEASE?.trim() || asTrimmedString(file.release),
+  };
 }
 
 /**
@@ -56,45 +83,18 @@ function readConfigFile(): Partial<Record<keyof LangfuseConfig, unknown>> {
   }
 }
 
-function loadConfig(): LangfuseConfig | undefined {
-  // Kill switch: wins over both env keys and the config file.
-  if ((process.env.LANGFUSE_TRACING_ENABLED ?? "").trim().toLowerCase() === "false") {
-    return undefined;
-  }
-  const file = readConfigFile();
-  const str = (v: unknown): string | undefined =>
-    typeof v === "string" && v.trim() ? v.trim() : undefined;
-
-  const publicKey = process.env.LANGFUSE_PUBLIC_KEY?.trim() || str(file.publicKey);
-  const secretKey = process.env.LANGFUSE_SECRET_KEY?.trim() || str(file.secretKey);
-  if (!publicKey || !secretKey) return undefined;
-  const baseUrl =
-    process.env.LANGFUSE_BASE_URL?.trim() ||
-    process.env.LANGFUSE_HOST?.trim() ||
-    str(file.baseUrl) ||
-    "https://cloud.langfuse.com";
-  return {
-    publicKey,
-    secretKey,
-    baseUrl: baseUrl.replace(/\/$/, ""),
-    userId: process.env.LANGFUSE_USER_ID?.trim() || str(file.userId),
-    environment: process.env.LANGFUSE_TRACING_ENVIRONMENT?.trim() || str(file.environment),
-    release: process.env.LANGFUSE_RELEASE?.trim() || str(file.release),
-  };
-}
-
 // ---------------------------------------------------------------------------
 // Payload helpers
 // ---------------------------------------------------------------------------
 
-interface TruncationMeta {
+export interface TruncationMeta {
   truncated: boolean;
   orig_len: number;
   kept_len?: number;
   sha256?: string;
 }
 
-function truncate(text: string): { text: string; meta: TruncationMeta } {
+export function truncateText(text: string): { text: string; meta: TruncationMeta } {
   if (text.length <= MAX_CHARS) {
     return { text, meta: { truncated: false, orig_len: text.length } };
   }
@@ -109,7 +109,7 @@ function truncate(text: string): { text: string; meta: TruncationMeta } {
   };
 }
 
-function maskSecrets(data: unknown, secrets: readonly string[]): unknown {
+export function maskSecrets(data: unknown, secrets: readonly string[]): unknown {
   return maskValue(data, secrets, new WeakSet<object>());
 }
 
@@ -135,7 +135,7 @@ function maskValue(data: unknown, secrets: readonly string[], seen: WeakSet<obje
 }
 
 /** Extract plain text from a pi message content array. */
-function contentText(content: unknown): string {
+export function extractText(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content
@@ -144,21 +144,21 @@ function contentText(content: unknown): string {
     .join("");
 }
 
-function toolCallsOf(content: unknown): Array<{ id: string; name: string }> {
+export function extractToolCalls(content: unknown): Array<{ id: string; name: string }> {
   if (!Array.isArray(content)) return [];
   return content
     .filter((p): p is { type: string; id: string; name: string } => !!p && typeof p === "object" && (p as { type?: string }).type === "toolCall")
     .map((p) => ({ id: p.id, name: p.name }));
 }
 
-function sessionLabel(sessionId: string): string {
+export function shortSessionLabel(sessionId: string): string {
   if (!sessionId) return "unknown";
   const parts = sessionId.split("-");
   if (parts.length === 5 && parts[0]?.length === 8) return parts[0];
   return sessionId.slice(0, 12).replace(/-+$/, "") || "unknown";
 }
 
-interface PiUsage {
+export interface PiUsage {
   input: number;
   output: number;
   cacheRead: number;
@@ -167,7 +167,7 @@ interface PiUsage {
   cost?: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
 }
 
-function usageDetails(usage: PiUsage): Record<string, number> | undefined {
+export function buildUsageDetails(usage: PiUsage): Record<string, number> | undefined {
   const details: Record<string, number> = {};
   if (usage.input > 0) details.input = usage.input;
   if (usage.output > 0) details.output = usage.output;
@@ -176,7 +176,7 @@ function usageDetails(usage: PiUsage): Record<string, number> | undefined {
   return Object.keys(details).length ? details : undefined;
 }
 
-function costDetails(usage: PiUsage): Record<string, number> | undefined {
+export function buildCostDetails(usage: PiUsage): Record<string, number> | undefined {
   const cost = usage.cost;
   if (!cost || !(cost.total > 0)) return undefined;
   const details: Record<string, number> = { total: cost.total };
@@ -264,7 +264,7 @@ export default function (pi: ExtensionAPI) {
     return runtime;
   };
 
-  const turnNumberFor = (ctx: ExtensionContext, promptText: string): number => {
+  const resolveTurnNumber = (ctx: ExtensionContext, promptText: string): number => {
     try {
       const entries = ctx.sessionManager.getEntries() as Array<{
         type?: string;
@@ -276,7 +276,7 @@ export default function (pi: ExtensionAPI) {
       let count = userMessages.length;
       const last = userMessages[userMessages.length - 1];
       // before_agent_start may fire before or after the prompt is appended.
-      if (last && contentText(last.message?.content) !== promptText) count += 1;
+      if (last && extractText(last.message?.content) !== promptText) count += 1;
       if (count < 1) count = 1;
       fallbackTurnCounter = count;
       return count;
@@ -286,7 +286,7 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  const closeDangling = (reason: "interrupted" | "superseded") => {
+  const closeDanglingObservations = (reason: "interrupted" | "superseded") => {
     if (!state) return;
     for (const [, tool] of state.openTools) {
       tool.obs.update({ level: "WARNING", statusMessage: `Tool run ${reason}`, metadata: { [reason]: true } });
@@ -304,8 +304,8 @@ export default function (pi: ExtensionAPI) {
 
   const finalizeRoot = (opts: { cancelled: boolean }) => {
     if (!state) return;
-    closeDangling("interrupted");
-    const { text, meta } = truncate(state.lastAssistantText ?? "");
+    closeDanglingObservations("interrupted");
+    const { text, meta } = truncateText(state.lastAssistantText ?? "");
     state.root.update({
       output: state.lastAssistantText ? { role: "assistant", content: text } : undefined,
       level: state.sawError ? "ERROR" : undefined,
@@ -357,9 +357,9 @@ export default function (pi: ExtensionAPI) {
     if (state) finalizeRoot({ cancelled: true });
 
     const sessionId = ctx.sessionManager.getSessionId();
-    const turnNumber = turnNumberFor(ctx, event.prompt);
+    const turnNumber = resolveTurnNumber(ctx, event.prompt);
     lastPromptText = event.prompt;
-    const { text: userText, meta: userMeta } = truncate(event.prompt);
+    const { text: userText, meta: userMeta } = truncateText(event.prompt);
 
     const root = startObservation(
       ROOT_OBSERVATION_NAME,
@@ -384,7 +384,7 @@ export default function (pi: ExtensionAPI) {
     // extension must not install).
     root.otelSpan.setAttribute(
       LangfuseOtelSpanAttributes.TRACE_NAME,
-      `Pi - Turn ${turnNumber} (${sessionLabel(sessionId)})`,
+      `Pi - Turn ${turnNumber} (${shortSessionLabel(sessionId)})`,
     );
     root.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_SESSION_ID, sessionId);
     root.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_TAGS, BASE_TAGS);
@@ -415,7 +415,7 @@ export default function (pi: ExtensionAPI) {
     const index = ++state.generationCount;
     const generationInput =
       index === 1
-        ? { role: "user", content: truncate(lastPromptText).text }
+        ? { role: "user", content: truncateText(lastPromptText).text }
         : state.pendingToolResults.length
           ? { role: "tool", tool_results: state.pendingToolResults }
           : undefined;
@@ -438,7 +438,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_update", (event) => {
     const gen = state?.openGeneration;
     if (!gen || gen.finished || gen.sawFirstToken) return;
-    if (contentText((event.message as { content?: unknown })?.content).length > 0) {
+    if (extractText((event.message as { content?: unknown })?.content).length > 0) {
       gen.sawFirstToken = true;
       gen.obs.update({ completionStartTime: new Date() });
     }
@@ -461,9 +461,9 @@ export default function (pi: ExtensionAPI) {
     const gen = state.openGeneration;
     if (!gen || gen.finished) return;
 
-    const text = contentText(message.content);
-    const tools = toolCallsOf(message.content);
-    const { text: outText, meta: outMeta } = truncate(text);
+    const text = extractText(message.content);
+    const tools = extractToolCalls(message.content);
+    const { text: outText, meta: outMeta } = truncateText(text);
     const isError = message.stopReason === "error" || message.stopReason === "aborted";
     if (message.stopReason === "error") state.sawError = true;
 
@@ -474,8 +474,8 @@ export default function (pi: ExtensionAPI) {
         ...(tools.length ? { tool_calls: tools } : {}),
       },
       model: message.model,
-      usageDetails: message.usage ? usageDetails(message.usage) : undefined,
-      costDetails: message.usage ? costDetails(message.usage) : undefined,
+      usageDetails: message.usage ? buildUsageDetails(message.usage) : undefined,
+      costDetails: message.usage ? buildCostDetails(message.usage) : undefined,
       ...(isError
         ? {
             level: "ERROR" as const,
@@ -517,8 +517,8 @@ export default function (pi: ExtensionAPI) {
     state.openTools.delete(event.toolCallId);
 
     const result = event.result as { content?: unknown } | undefined;
-    const rawOutput = contentText(result?.content) || safeStringify(result?.content);
-    const { text: outText, meta: outMeta } = truncate(rawOutput);
+    const rawOutput = extractText(result?.content) || safeStringify(result?.content);
+    const { text: outText, meta: outMeta } = truncateText(rawOutput);
     if (event.isError) state.sawError = true;
 
     open.obs.update({
