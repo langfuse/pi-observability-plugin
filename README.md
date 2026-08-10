@@ -85,8 +85,16 @@ Scripting note: in `pi -p` (print mode) close stdin (`pi -p "..." < /dev/null`)
 ## Development
 
 ```bash
-npm run typecheck
+npm run typecheck   # strict TS check (no build — pi runs the TS directly)
+npm test            # unit + config + end-to-end tests (~5s, fully sandboxed)
 ```
+
+The end-to-end tests spawn the real pi CLI (devDependency) inside throwaway
+temp sandboxes (`PI_CODING_AGENT_DIR`), drive it with a deterministic
+in-process mock model, capture the actual OTLP export with a fake Langfuse
+ingest on an ephemeral port, and assert the full span tree — names, nesting,
+types, usage/cost mapping, error levels, session grouping, turn numbering,
+kill switch and config-file resolution. Your `~/.pi` is never touched.
 
 The extension ships as raw TypeScript (`src/index.ts`, loaded by pi via jiti —
 no build step). Runtime deps: `@langfuse/tracing` + `@langfuse/otel` (v5 OTEL

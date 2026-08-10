@@ -23,7 +23,9 @@
     "opentelemetry"
   ],
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
   "files": [
     "src",
@@ -32,7 +34,8 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/"
+    "test": "node --test test/*.test.ts",
+    "test:unit": "node --test test/unit.test.ts test/config.test.ts"
   },
   "dependencies": {
     "@langfuse/otel": "^5.10.0",
