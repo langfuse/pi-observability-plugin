@@ -76,13 +76,20 @@ export function startMockProvider(): Promise<{ port: number; close: () => void }
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
-      const payload = JSON.parse(body) as { model?: string; messages?: OpenAiMessage[] };
+      const payload = JSON.parse(body) as {
+        model?: string;
+        messages?: OpenAiMessage[];
+        tools?: Array<{ function?: { name?: string } }>;
+      };
       const messages = payload.messages ?? [];
       const model = payload.model ?? "mock-gpt-1";
       const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
       const stage = messages.slice(lastUserIdx + 1).filter((m) => m.role === "tool").length;
       const lastUser = messages[lastUserIdx];
       const failMode = JSON.stringify(lastUser?.content ?? "").includes("[fail]");
+      // True only when a test loads the subagent fixture. The default script
+      // does not change for the other tests.
+      const canDelegate = (payload.tools ?? []).some((t) => t.function?.name === "subagent");
 
       res.writeHead(200, { "content-type": "text/event-stream" });
       const usage = (p: number, c: number, cached: number) => ({
@@ -92,7 +99,20 @@ export function startMockProvider(): Promise<{ port: number; close: () => void }
         prompt_tokens_details: { cached_tokens: cached },
       });
 
-      if (failMode && stage === 0) {
+      if (canDelegate && stage === 0) {
+        streamChunks(res, model, {
+          text: "Delegating to a subagent. ",
+          tool: { name: "subagent", args: { task: "inspect the repository" } },
+          finish: "tool_calls",
+          usage: usage(1200, 30, 0),
+        });
+      } else if (canDelegate) {
+        streamChunks(res, model, {
+          text: "The subagent reported back. Done.",
+          finish: "stop",
+          usage: usage(1500, 26, 1100),
+        });
+      } else if (failMode && stage === 0) {
         streamChunks(res, model, {
           text: "Reading the log file. ",
           tool: { name: "bash", args: { command: "cat does-not-exist.log" } },
@@ -270,11 +290,16 @@ export function createSandbox(mockPort: number): Sandbox {
 export function runPi(
   sandbox: Sandbox,
   prompt: string,
-  opts: { continue?: boolean; env?: Record<string, string | undefined> } = {},
+  opts: {
+    continue?: boolean;
+    env?: Record<string, string | undefined>;
+    /** More extensions to load with ours, for example the subagent fixture. */
+    extensions?: string[];
+  } = {},
 ): Promise<{ status: number | null; stdout: string; stderr: string }> {
-  const args = [
-    "-e",
-    EXTENSION,
+  const args = ["-e", EXTENSION];
+  for (const extra of opts.extensions ?? []) args.push("-e", extra);
+  args.push(
     "--provider",
     "mock",
     "--model",
@@ -282,7 +307,7 @@ export function runPi(
     "--api-key",
     "mock-key",
     "--no-context-files",
-  ];
+  );
   if (opts.continue) args.push("-c");
   args.push("-p", prompt);
 
@@ -304,6 +329,14 @@ export function runPi(
         LANGFUSE_TRACING_ENVIRONMENT: undefined,
         LANGFUSE_RELEASE: undefined,
         LANGFUSE_TRACING_ENABLED: undefined,
+        // A test run must not get a parent trace from this test process.
+        LANGFUSE_PI_PARENT_TRACE_ID: undefined,
+        LANGFUSE_PI_PARENT_SPAN_ID: undefined,
+        LANGFUSE_PI_PARENT_SESSION_ID: undefined,
+        LANGFUSE_PI_PARENT_DEPTH: undefined,
+        // The subagent fixture uses these values.
+        TEST_PI_BIN: PI_BIN,
+        TEST_LANGFUSE_EXTENSION: EXTENSION,
         ...opts.env,
       } as NodeJS.ProcessEnv,
     });

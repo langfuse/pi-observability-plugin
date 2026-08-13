@@ -12,15 +12,57 @@ import {
   setLangfuseTracerProvider,
   startObservation,
 } from "@langfuse/tracing";
+import { type SpanContext, TraceFlags } from "@opentelemetry/api";
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 
 const EXTENSION_NAME = "@langfuse/pi-observability-plugin";
 const EXTENSION_VERSION = "0.0.1";
 const ROOT_OBSERVATION_NAME = "Conversational Turn";
+const SUBAGENT_ROOT_OBSERVATION_NAME = "Subagent Turn";
 const GENERATION_PREFIX = "LLM Call"; 
 const TOOL_PREFIX = "Tool:";
 const BASE_TAGS = ["pi"];
 const MAX_CHARS = Number(process.env.PI_LANGFUSE_MAX_CHARS ?? "20000");
+
+// pi subagents are child processes that get process.env from the parent. pi
+// itself has no trace propagation, so these variables connect the traces.
+const ENV_PARENT_TRACE_ID = "LANGFUSE_PI_PARENT_TRACE_ID";
+const ENV_PARENT_SPAN_ID = "LANGFUSE_PI_PARENT_SPAN_ID";
+const ENV_PARENT_SESSION_ID = "LANGFUSE_PI_PARENT_SESSION_ID";
+const ENV_PARENT_DEPTH = "LANGFUSE_PI_PARENT_DEPTH";
+
+const HEX_TRACE_ID = /^[0-9a-f]{32}$/;
+const HEX_SPAN_ID = /^[0-9a-f]{16}$/;
+
+export interface InheritedParent {
+  spanContext: SpanContext;
+  sessionId?: string;
+  depth: number;
+}
+
+/**
+ * Reads the parent trace context from the environment. Bad or missing ids give
+ * undefined, so an old variable cannot attach a span to a wrong trace.
+ */
+export function readInheritedParent(env: NodeJS.ProcessEnv = process.env): InheritedParent | undefined {
+  const traceId = env[ENV_PARENT_TRACE_ID]?.trim().toLowerCase();
+  const spanId = env[ENV_PARENT_SPAN_ID]?.trim().toLowerCase();
+  if (!traceId || !spanId) return undefined;
+  if (!HEX_TRACE_ID.test(traceId) || !HEX_SPAN_ID.test(spanId)) return undefined;
+  // OTel defines the all-zero ids as invalid.
+  if (/^0+$/.test(traceId) || /^0+$/.test(spanId)) return undefined;
+  const depth = Number(env[ENV_PARENT_DEPTH] ?? "0");
+  return {
+    spanContext: {
+      traceId,
+      spanId,
+      traceFlags: TraceFlags.SAMPLED,
+      isRemote: true,
+    },
+    sessionId: env[ENV_PARENT_SESSION_ID]?.trim() || undefined,
+    depth: Number.isFinite(depth) && depth > 0 ? depth : 0,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -258,6 +300,15 @@ export default function (pi: ExtensionAPI) {
   let gitBranch: string | undefined;
   let fallbackTurnCounter = 0;
   let lastPromptText = "";
+  // Read once at load. A subagent must not read the variables that it
+  // publishes for its own children.
+  const inheritedParent = readInheritedParent();
+  const inheritedParentEnv: Record<string, string | undefined> = {
+    [ENV_PARENT_TRACE_ID]: process.env[ENV_PARENT_TRACE_ID],
+    [ENV_PARENT_SPAN_ID]: process.env[ENV_PARENT_SPAN_ID],
+    [ENV_PARENT_SESSION_ID]: process.env[ENV_PARENT_SESSION_ID],
+    [ENV_PARENT_DEPTH]: process.env[ENV_PARENT_DEPTH],
+  };
 
   const ensureRuntime = (): Runtime => {
     if (!runtime || runtime.shutdown) runtime = createRuntime(config);
@@ -302,6 +353,28 @@ export default function (pi: ExtensionAPI) {
     state.openGeneration = undefined;
   };
 
+  // The turn root is the parent for subagents. pi runs tool calls in parallel,
+  // so one global variable cannot point to one of many tool spans.
+  const publishParentContext = (root: LangfuseSpan, sessionId: string) => {
+    const ctx = root.otelSpan.spanContext();
+    // Do not publish a root that the sampler dropped. Child spans would point
+    // to a trace with no exported root.
+    if (!(ctx.traceFlags & TraceFlags.SAMPLED)) return;
+    process.env[ENV_PARENT_TRACE_ID] = ctx.traceId;
+    process.env[ENV_PARENT_SPAN_ID] = ctx.spanId;
+    process.env[ENV_PARENT_SESSION_ID] = sessionId;
+    process.env[ENV_PARENT_DEPTH] = String((inheritedParent?.depth ?? 0) + 1);
+  };
+
+  // A child must not attach to a turn that has ended. The inherited values
+  // stay valid, so put them back instead of a plain delete.
+  const withdrawParentContext = () => {
+    for (const [key, value] of Object.entries(inheritedParentEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+
   const finalizeRoot = (opts: { cancelled: boolean }) => {
     if (!state) return;
     closeDanglingObservations("interrupted");
@@ -315,6 +388,7 @@ export default function (pi: ExtensionAPI) {
       },
     });
     state.root.end();
+    withdrawParentContext();
     state = undefined;
   };
 
@@ -360,9 +434,11 @@ export default function (pi: ExtensionAPI) {
     const turnNumber = resolveTurnNumber(ctx, event.prompt);
     lastPromptText = event.prompt;
     const { text: userText, meta: userMeta } = truncateText(event.prompt);
+    const isSubagent = Boolean(inheritedParent);
 
+    // A subagent joins the trace of the parent turn instead of a new trace.
     const root = startObservation(
-      ROOT_OBSERVATION_NAME,
+      isSubagent ? SUBAGENT_ROOT_OBSERVATION_NAME : ROOT_OBSERVATION_NAME,
       {
         input: { role: "user", content: userText },
         metadata: {
@@ -375,21 +451,25 @@ export default function (pi: ExtensionAPI) {
           user_text_meta: userMeta,
           ...(gitBranch ? { git_branch: gitBranch } : {}),
           ...(ctx.model ? { model: ctx.model.id, provider: ctx.model.provider } : {}),
+          ...(isSubagent
+            ? { pi_subagent: true, subagent_depth: inheritedParent!.depth, parent_session_id: inheritedParent!.sessionId }
+            : {}),
         },
       },
-      { asType: "span" },
+      { asType: "span", ...(inheritedParent ? { parentSpanContext: inheritedParent.spanContext } : {}) },
     );
-    // Trace-level fields live as attributes on the root span (the SDK's
-    // context-based propagation needs a global context manager, which an
-    // extension must not install).
-    root.otelSpan.setAttribute(
-      LangfuseOtelSpanAttributes.TRACE_NAME,
-      `Pi - Turn ${turnNumber} (${shortSessionLabel(sessionId)})`,
-    );
-    root.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_SESSION_ID, sessionId);
-    root.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_TAGS, BASE_TAGS);
-    if (config.userId) {
-      root.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_USER_ID, config.userId);
+    // Trace fields go on the root span, because an extension must not install
+    // the global OTel context manager. Only the top process sets them.
+    if (!isSubagent) {
+      root.otelSpan.setAttribute(
+        LangfuseOtelSpanAttributes.TRACE_NAME,
+        `Pi - Turn ${turnNumber} (${shortSessionLabel(sessionId)})`,
+      );
+      root.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_SESSION_ID, sessionId);
+      root.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_TAGS, BASE_TAGS);
+      if (config.userId) {
+        root.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_USER_ID, config.userId);
+      }
     }
 
     state = {
@@ -400,6 +480,7 @@ export default function (pi: ExtensionAPI) {
       pendingToolResults: [],
       sawError: false,
     };
+    publishParentContext(root, sessionId);
     debug("root created, turn", turnNumber);
   });
 

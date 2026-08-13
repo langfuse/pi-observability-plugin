@@ -82,6 +82,18 @@ Scripting note: in `pi -p` (print mode) close stdin (`pi -p "..." < /dev/null`)
 
 `PI_LANGFUSE_DEBUG=true` prints extension breadcrumbs to stderr.
 
+## Subagent nesting
+
+pi's subagent pattern (its own example extension and the gallery orchestration
+packages) spawns a separate `pi` process per task; children inherit the parent's
+environment. This extension publishes the current turn's ids as
+`LANGFUSE_PI_PARENT_TRACE_ID` / `LANGFUSE_PI_PARENT_SPAN_ID` (plus
+`LANGFUSE_PI_PARENT_SESSION_ID` and `LANGFUSE_PI_PARENT_DEPTH`) while the turn is
+active, and a pi process that finds them nests its trace under the spawning turn
+instead of starting an orphan. Set them yourself to attach a run to an external
+trace; the ids must belong to the same Langfuse project the run exports to.
+Nothing to configure for the built-in flow.
+
 ## Development
 
 ```bash
