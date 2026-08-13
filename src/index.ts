@@ -167,10 +167,20 @@ export interface PiUsage {
   cost?: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
 }
 
+/**
+ * Changes the pi usage counts into Langfuse usage details. Langfuse counts each
+ * token in one key only, but pi includes the reasoning tokens in `output`.
+ */
 export function buildUsageDetails(usage: PiUsage): Record<string, number> | undefined {
   const details: Record<string, number> = {};
   if (usage.input > 0) details.input = usage.input;
-  if (usage.output > 0) details.output = usage.output;
+  // Do not split when a provider reports more reasoning than output tokens.
+  // A count that is too large makes the total wrong.
+  const reasoning = usage.reasoning ?? 0;
+  const canSplitReasoning = reasoning > 0 && reasoning <= usage.output;
+  const output = canSplitReasoning ? usage.output - reasoning : usage.output;
+  if (output > 0) details.output = output;
+  if (canSplitReasoning) details.output_reasoning_tokens = reasoning;
   if (usage.cacheRead > 0) details.cache_read_input_tokens = usage.cacheRead;
   if (usage.cacheWrite > 0) details.cache_creation_input_tokens = usage.cacheWrite;
   return Object.keys(details).length ? details : undefined;

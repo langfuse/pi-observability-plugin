@@ -155,4 +155,33 @@ describe("buildUsageDetails / buildCostDetails", () => {
       undefined,
     );
   });
+
+  it("splits reasoning tokens out of output so the buckets stay exclusive", () => {
+    assert.deepEqual(
+      buildUsageDetails({ input: 500, output: 300, cacheRead: 0, cacheWrite: 0, reasoning: 200 }),
+      { input: 500, output: 100, output_reasoning_tokens: 200 },
+    );
+  });
+
+  it("keeps output intact when a provider reports inconsistent reasoning counts", () => {
+    assert.deepEqual(
+      buildUsageDetails({ input: 10, output: 5, cacheRead: 0, cacheWrite: 0, reasoning: 9 }),
+      { input: 10, output: 5 },
+    );
+  });
+
+  it("ignores a zero reasoning count from providers that always report the field", () => {
+    assert.deepEqual(
+      buildUsageDetails({ input: 10, output: 20, cacheRead: 0, cacheWrite: 0, reasoning: 0 }),
+      { input: 10, output: 20 },
+    );
+  });
+
+  it("emits only the reasoning bucket when all output tokens are reasoning", () => {
+    // A model can think and write no text. Then the result has no `output` key.
+    assert.deepEqual(
+      buildUsageDetails({ input: 10, output: 50, cacheRead: 0, cacheWrite: 0, reasoning: 50 }),
+      { input: 10, output_reasoning_tokens: 50 },
+    );
+  });
 });

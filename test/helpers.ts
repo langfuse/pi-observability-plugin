@@ -85,11 +85,14 @@ export function startMockProvider(): Promise<{ port: number; close: () => void }
       const failMode = JSON.stringify(lastUser?.content ?? "").includes("[fail]");
 
       res.writeHead(200, { "content-type": "text/event-stream" });
-      const usage = (p: number, c: number, cached: number) => ({
+      // The pi openai adapter reads the reasoning tokens from
+      // completion_tokens_details.reasoning_tokens, a part of completion_tokens.
+      const usage = (p: number, c: number, cached: number, reasoning = 0) => ({
         prompt_tokens: p,
         completion_tokens: c,
         total_tokens: p + c,
         prompt_tokens_details: { cached_tokens: cached },
+        completion_tokens_details: { reasoning_tokens: reasoning },
       });
 
       if (failMode && stage === 0) {
@@ -123,7 +126,7 @@ export function startMockProvider(): Promise<{ port: number; close: () => void }
         streamChunks(res, model, {
           text: "This is the test workspace. Done.",
           finish: "stop",
-          usage: usage(1600, 78, 1280),
+          usage: usage(1600, 78, 1280, 30),
         });
       }
     });
