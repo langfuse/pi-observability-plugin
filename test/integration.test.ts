@@ -106,6 +106,12 @@ describe("integration: pi -> extension -> Langfuse export", () => {
         costs.some((c) => Math.abs((c.total ?? 0) - 0.0019002) < 1e-9),
         "buildCostDetails must carry pi's client-side pricing",
       );
+      const cachedCost = costs.find((c) => c.cache_read_input_tokens !== undefined);
+      assert.ok(cachedCost, "cache cost must use the canonical usage key spelling");
+      assert.ok(
+        Math.abs((cachedCost?.cache_read_input_tokens ?? 0) - 0.0003072) < 1e-9,
+        "cache_read_input_tokens cost must match the mock price table",
+      );
 
       // Every span is closed with a real duration
       for (const span of tree) {

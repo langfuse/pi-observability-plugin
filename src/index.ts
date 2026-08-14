@@ -186,14 +186,18 @@ export function buildUsageDetails(usage: PiUsage): Record<string, number> | unde
   return Object.keys(details).length ? details : undefined;
 }
 
+/**
+ * Cost keys must mirror the usage keys ({@link buildUsageDetails}) — Langfuse
+ * joins the two by name, and server-side pricing emits the same spellings.
+ */
 export function buildCostDetails(usage: PiUsage): Record<string, number> | undefined {
   const cost = usage.cost;
   if (!cost || !(cost.total > 0)) return undefined;
   const details: Record<string, number> = { total: cost.total };
   if (cost.input > 0) details.input = cost.input;
   if (cost.output > 0) details.output = cost.output;
-  if (cost.cacheRead > 0) details.cache_read = cost.cacheRead;
-  if (cost.cacheWrite > 0) details.cache_write = cost.cacheWrite;
+  if (cost.cacheRead > 0) details.cache_read_input_tokens = cost.cacheRead;
+  if (cost.cacheWrite > 0) details.cache_creation_input_tokens = cost.cacheWrite;
   return details;
 }
 

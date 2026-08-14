@@ -137,9 +137,17 @@ describe("buildUsageDetails / buildCostDetails", () => {
       total: 0.0079685,
       input: 0.00001,
       output: 0.0066,
-      cache_read: 0.0011335,
-      cache_write: 0.000225,
+      cache_read_input_tokens: 0.0011335,
+      cache_creation_input_tokens: 0.000225,
     });
+  });
+
+  it("keeps cost keys mirroring usage keys so Langfuse can join them", () => {
+    const usageKeys = Object.keys(buildUsageDetails(usage) ?? {});
+    const costKeys = Object.keys(buildCostDetails(usage) ?? {}).filter((k) => k !== "total");
+    for (const key of costKeys) {
+      assert.ok(usageKeys.includes(key), `cost key "${key}" has no matching usage key`);
+    }
   });
 
   it("omits cost details entirely when pi has no pricing (server-side pricing takes over)", () => {
