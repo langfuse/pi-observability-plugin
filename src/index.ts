@@ -40,10 +40,6 @@ export interface InheritedParent {
   depth: number;
 }
 
-/**
- * Reads the parent trace context from the environment. Bad or missing ids give
- * undefined, so an old variable cannot attach a span to a wrong trace.
- */
 export function readInheritedParent(env: NodeJS.ProcessEnv = process.env): InheritedParent | undefined {
   const traceId = env[ENV_PARENT_TRACE_ID]?.trim().toLowerCase();
   const spanId = env[ENV_PARENT_SPAN_ID]?.trim().toLowerCase();
@@ -300,8 +296,6 @@ export default function (pi: ExtensionAPI) {
   let gitBranch: string | undefined;
   let fallbackTurnCounter = 0;
   let lastPromptText = "";
-  // Read once at load. A subagent must not read the variables that it
-  // publishes for its own children.
   const inheritedParent = readInheritedParent();
   const inheritedParentEnv: Record<string, string | undefined> = {
     [ENV_PARENT_TRACE_ID]: process.env[ENV_PARENT_TRACE_ID],
@@ -436,7 +430,6 @@ export default function (pi: ExtensionAPI) {
     const { text: userText, meta: userMeta } = truncateText(event.prompt);
     const isSubagent = Boolean(inheritedParent);
 
-    // A subagent joins the trace of the parent turn instead of a new trace.
     const root = startObservation(
       isSubagent ? SUBAGENT_ROOT_OBSERVATION_NAME : ROOT_OBSERVATION_NAME,
       {
