@@ -18,7 +18,8 @@ import { join, resolve } from "node:path";
 import zlib from "node:zlib";
 
 export const REPO_ROOT = resolve(import.meta.dirname, "..");
-const PI_BIN = join(REPO_ROOT, "node_modules", ".bin", "pi");
+// PI_BIN lets CI run the same tests against other pi versions.
+const PI_BIN = process.env.PI_BIN || join(REPO_ROOT, "node_modules", ".bin", "pi");
 const EXTENSION = join(REPO_ROOT, "src", "index.ts");
 
 // --------------------------------------------------------------------------
@@ -312,6 +313,12 @@ export function runPi(
     child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
     child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
     const killer = setTimeout(() => child.kill("SIGKILL"), 60_000);
+    // A process that cannot start emits "error" and never "close", and the
+    // timer above cannot stop a process that does not exist.
+    child.on("error", (err) => {
+      clearTimeout(killer);
+      resolvePromise({ status: null, stdout, stderr: stderr + String(err) });
+    });
     child.on("close", (code) => {
       clearTimeout(killer);
       resolvePromise({ status: code, stdout, stderr });
