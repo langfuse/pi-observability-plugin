@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # pi releases several minor versions each week, so a failure can appear
+  # without pull request activity.
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+# Pushes and scheduled runs fall back to the run id, so they never cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+
+  test:
+    # The suite starts the real pi command-line interface, so a test against
+    # more than one pi release gives an early warning. `pi-version: ""` selects
+    # the version from devDependencies.
+    name: Test (pi ${{ matrix.pi-version || 'devDependency' }}, Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # The scheduled run must find failures that new pi releases cause.
+        # Therefore it uses `latest` only, and it omits the fixed versions.
+        node: ${{ github.event_name == 'schedule' && fromJSON('[22]') || fromJSON('[22, 24]') }}
+        pi-version: ${{ github.event_name == 'schedule' && fromJSON('["latest"]') || fromJSON('["", "0.83.0", "0.84.1", "latest"]') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Install pi ${{ matrix.pi-version }}
+        if: matrix.pi-version != ''
+        # The version goes to the shell as an environment variable, so no
+        # workflow expression becomes executable code.
+        env:
+          PI_VERSION: ${{ matrix.pi-version }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/pi-matrix"
+          cd "$RUNNER_TEMP/pi-matrix"
+          npm init -y >/dev/null
+          npm install --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}"
+          echo "PI_BIN=$RUNNER_TEMP/pi-matrix/node_modules/.bin/pi" >> "$GITHUB_ENV"
+          ./node_modules/.bin/pi --version
+      - name: Test
+        run: npm test
+        env:
+          PI_SKIP_VERSION_CHECK: "1"
+          PI_TELEMETRY: "0"
