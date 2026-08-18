@@ -1,0 +1,7 @@
+rules:
+  adhoc-packages:
+    ignore:
+      # The CI test matrix installs pi versions 0.83.0, 0.84.1 and latest into
+      # $RUNNER_TEMP. These versions are different from the devDependency. The
+      # installation is outside the lock file because the test needs it.
+      - ci.yml
