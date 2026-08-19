@@ -18,7 +18,8 @@ import { join, resolve } from "node:path";
 import zlib from "node:zlib";
 
 export const REPO_ROOT = resolve(import.meta.dirname, "..");
-const PI_BIN = join(REPO_ROOT, "node_modules", ".bin", "pi");
+// PI_BIN lets CI run the same tests against other pi versions.
+const PI_BIN = process.env.PI_BIN || join(REPO_ROOT, "node_modules", ".bin", "pi");
 const EXTENSION = join(REPO_ROOT, "src", "index.ts");
 
 // --------------------------------------------------------------------------
@@ -92,11 +93,14 @@ export function startMockProvider(): Promise<{ port: number; close: () => void }
       const canDelegate = (payload.tools ?? []).some((t) => t.function?.name === "subagent");
 
       res.writeHead(200, { "content-type": "text/event-stream" });
-      const usage = (p: number, c: number, cached: number) => ({
+      // The pi openai adapter reads the reasoning tokens from
+      // completion_tokens_details.reasoning_tokens, a part of completion_tokens.
+      const usage = (p: number, c: number, cached: number, reasoning = 0) => ({
         prompt_tokens: p,
         completion_tokens: c,
         total_tokens: p + c,
         prompt_tokens_details: { cached_tokens: cached },
+        completion_tokens_details: { reasoning_tokens: reasoning },
       });
 
       if (canDelegate && stage === 0) {
@@ -143,7 +147,7 @@ export function startMockProvider(): Promise<{ port: number; close: () => void }
         streamChunks(res, model, {
           text: "This is the test workspace. Done.",
           finish: "stop",
-          usage: usage(1600, 78, 1280),
+          usage: usage(1600, 78, 1280, 30),
         });
       }
     });
@@ -345,10 +349,17 @@ export function runPi(
     child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
     child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
     const killer = setTimeout(() => child.kill("SIGKILL"), 60_000);
-    child.on("close", (code) => {
+    // A failed spawn emits "error" and then "close", so both handlers run. The
+    // first result must win: only "error" carries the spawn failure.
+    let settled = false;
+    const finish = (status: number | null, spawnError = "") => {
+      if (settled) return;
+      settled = true;
       clearTimeout(killer);
-      resolvePromise({ status: code, stdout, stderr });
-    });
+      resolvePromise({ status, stdout, stderr: stderr + spawnError });
+    };
+    child.on("error", (err) => finish(null, String(err)));
+    child.on("close", (code) => finish(code));
   });
 }
 

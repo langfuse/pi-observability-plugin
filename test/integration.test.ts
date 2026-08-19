@@ -92,12 +92,26 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       const cached = usages.find((u) => u.cache_read_input_tokens === 1024);
       assert.ok(cached, "cache_read_input_tokens must be mapped");
       assert.equal(cached?.input, 326, "input must exclude cached tokens (no double counting)");
+      // The mock gives 30 reasoning tokens to the last generation. This makes
+      // sure that the split is correct through the real pi pipeline.
+      const reasoned = usages.find((u) => u.output_reasoning_tokens !== undefined);
+      assert.deepEqual(
+        reasoned,
+        { input: 320, output: 48, output_reasoning_tokens: 30, cache_read_input_tokens: 1280 },
+        "reasoning tokens must be split out of output end-to-end",
+      );
       const costs = generations.map(
         (g) => JSON.parse(String(g.attrs["langfuse.observation.cost_details"])) as Record<string, number>,
       );
       assert.ok(
         costs.some((c) => Math.abs((c.total ?? 0) - 0.0019002) < 1e-9),
         "buildCostDetails must carry pi's client-side pricing",
+      );
+      const cachedCost = costs.find((c) => c.cache_read_input_tokens !== undefined);
+      assert.ok(cachedCost, "cache cost must use the canonical usage key spelling");
+      assert.ok(
+        Math.abs((cachedCost?.cache_read_input_tokens ?? 0) - 0.0003072) < 1e-9,
+        "cache_read_input_tokens cost must match the mock price table",
       );
 
       // Every span is closed with a real duration
