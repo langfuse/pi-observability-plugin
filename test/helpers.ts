@@ -18,7 +18,8 @@ import { join, resolve } from "node:path";
 import zlib from "node:zlib";
 
 export const REPO_ROOT = resolve(import.meta.dirname, "..");
-const PI_BIN = join(REPO_ROOT, "node_modules", ".bin", "pi");
+// PI_BIN lets CI run the same tests against other pi versions.
+const PI_BIN = process.env.PI_BIN || join(REPO_ROOT, "node_modules", ".bin", "pi");
 const EXTENSION = join(REPO_ROOT, "src", "index.ts");
 
 // --------------------------------------------------------------------------
@@ -312,10 +313,17 @@ export function runPi(
     child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
     child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
     const killer = setTimeout(() => child.kill("SIGKILL"), 60_000);
-    child.on("close", (code) => {
+    // A failed spawn emits "error" and then "close", so both handlers run. The
+    // first result must win: only "error" carries the spawn failure.
+    let settled = false;
+    const finish = (status: number | null, spawnError = "") => {
+      if (settled) return;
+      settled = true;
       clearTimeout(killer);
-      resolvePromise({ status: code, stdout, stderr });
-    });
+      resolvePromise({ status, stdout, stderr: stderr + spawnError });
+    };
+    child.on("error", (err) => finish(null, String(err)));
+    child.on("close", (code) => finish(code));
   });
 }
 
