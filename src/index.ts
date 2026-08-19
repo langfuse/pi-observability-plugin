@@ -22,6 +22,13 @@ const TOOL_PREFIX = "Tool:";
 const BASE_TAGS = ["pi"];
 const MAX_CHARS = Number(process.env.PI_LANGFUSE_MAX_CHARS ?? "20000");
 
+// A data: URI is only worth emitting if the processor swaps it for a media
+// reference; with uploads off it stays in the span as full base64.
+const EMIT_IMAGE_MEDIA = (() => {
+  const raw = process.env.LANGFUSE_MEDIA_UPLOAD_ENABLED?.trim().toLowerCase();
+  return raw ? !["false", "0"].includes(raw) : true;
+})();
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -151,6 +158,80 @@ export function extractToolCalls(content: unknown): Array<{ id: string; name: st
     .map((p) => ({ id: p.id, name: p.name }));
 }
 
+export interface PiImagePart {
+  type: "image";
+  data: string;
+  mimeType: string;
+}
+
+export function extractImages(content: unknown): PiImagePart[] {
+  if (!Array.isArray(content)) return [];
+  return content.filter(
+    (p): p is PiImagePart =>
+      !!p &&
+      typeof p === "object" &&
+      (p as { type?: string }).type === "image" &&
+      typeof (p as { data?: unknown }).data === "string" &&
+      typeof (p as { mimeType?: unknown }).mimeType === "string",
+  );
+}
+
+export function describeImage(image: { type?: unknown; data?: unknown; mimeType?: unknown }): string {
+  const mime = typeof image.mimeType === "string" && image.mimeType ? image.mimeType : "unknown type";
+  if (typeof image.data !== "string" || !image.data) return `[image ${mime}]`;
+  const kb = Math.floor((image.data.length * 3) / 4 / 1024);
+  return `[image ${mime} ~${kb}KB]`;
+}
+
+export function renderContentWithImageMarkers(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((p) => {
+      if (!p || typeof p !== "object") return "";
+      const part = p as { type?: string; text?: string };
+      if (part.type === "text") return typeof part.text === "string" ? part.text : "";
+      if (part.type === "image") return describeImage(part as { data?: unknown; mimeType?: unknown });
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+export type ContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
+/**
+ * pi hands us raw base64. The processor detects media with
+ * `/data:[^;]+;base64,[A-Za-z0-9+/]+=*​/`, which silently matches a *prefix* of
+ * anything else and uploads that as a corrupt file.
+ */
+export function toDataUri(image: PiImagePart): string | undefined {
+  const data = image.data.replace(/\s+/g, "");
+  if (!data || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) return undefined;
+  if (!image.mimeType || image.mimeType.includes(";")) return undefined;
+  return `data:${image.mimeType};base64,${data}`;
+}
+
+/**
+ * Returns `text` unchanged when there are no images. With images it returns the
+ * OpenAI-style content parts (the text, then one `image_url` per image) that the
+ * Langfuse UI shows as a picture. Never truncate the result: a cut data URI is
+ * uploaded as a corrupt file.
+ */
+export function toMultimodalContent(
+  text: string,
+  images: readonly PiImagePart[] | undefined,
+): string | ContentPart[] {
+  const urls = (images ?? []).map(toDataUri).filter((url): url is string => !!url);
+  if (!urls.length) return text;
+  return [
+    ...(text ? [{ type: "text" as const, text }] : []),
+    ...urls.map((url) => ({ type: "image_url" as const, image_url: { url } })),
+  ];
+}
+
 export function shortSessionLabel(sessionId: string): string {
   if (!sessionId) return "unknown";
   const parts = sessionId.split("-");
@@ -167,23 +248,37 @@ export interface PiUsage {
   cost?: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
 }
 
+/**
+ * Changes the pi usage counts into Langfuse usage details. Langfuse counts each
+ * token in one key only, but pi includes the reasoning tokens in `output`.
+ */
 export function buildUsageDetails(usage: PiUsage): Record<string, number> | undefined {
   const details: Record<string, number> = {};
   if (usage.input > 0) details.input = usage.input;
-  if (usage.output > 0) details.output = usage.output;
+  // Do not split when a provider reports more reasoning than output tokens.
+  // A count that is too large makes the total wrong.
+  const reasoning = usage.reasoning ?? 0;
+  const canSplitReasoning = reasoning > 0 && reasoning <= usage.output;
+  const output = canSplitReasoning ? usage.output - reasoning : usage.output;
+  if (output > 0) details.output = output;
+  if (canSplitReasoning) details.output_reasoning_tokens = reasoning;
   if (usage.cacheRead > 0) details.cache_read_input_tokens = usage.cacheRead;
   if (usage.cacheWrite > 0) details.cache_creation_input_tokens = usage.cacheWrite;
   return Object.keys(details).length ? details : undefined;
 }
 
+/**
+ * Cost keys must mirror the usage keys ({@link buildUsageDetails}) — Langfuse
+ * joins the two by name, and server-side pricing emits the same spellings.
+ */
 export function buildCostDetails(usage: PiUsage): Record<string, number> | undefined {
   const cost = usage.cost;
   if (!cost || !(cost.total > 0)) return undefined;
   const details: Record<string, number> = { total: cost.total };
   if (cost.input > 0) details.input = cost.input;
   if (cost.output > 0) details.output = cost.output;
-  if (cost.cacheRead > 0) details.cache_read = cost.cacheRead;
-  if (cost.cacheWrite > 0) details.cache_write = cost.cacheWrite;
+  if (cost.cacheRead > 0) details.cache_read_input_tokens = cost.cacheRead;
+  if (cost.cacheWrite > 0) details.cache_creation_input_tokens = cost.cacheWrite;
   return details;
 }
 
@@ -209,7 +304,13 @@ function createRuntime(config: LangfuseConfig): Runtime {
     shouldExportSpan: ({ otelSpan }) =>
       typeof otelSpan.attributes["langfuse.observation.type"] === "string",
   });
-  const provider = new NodeTracerProvider({ spanProcessors: [processor] });
+  const provider = new NodeTracerProvider({
+    spanProcessors: [processor],
+    // OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT etc. must not apply here: a cut data
+    // URI still matches the media regex and uploads garbage. Payload size is
+    // bounded by our own truncateText instead.
+    spanLimits: { attributeValueLengthLimit: Infinity },
+  });
   setLangfuseTracerProvider(provider);
   return { processor, provider, shutdown: false };
 }
@@ -234,6 +335,8 @@ interface PromptState {
   pendingToolResults: Array<{ tool_call_id: string; name: string; content: string }>;
   lastAssistantText?: string;
   sawError: boolean;
+  userText: string;
+  turnImages: PiImagePart[];
 }
 
 const DEBUG = process.env.PI_LANGFUSE_DEBUG === "true";
@@ -256,6 +359,7 @@ export default function (pi: ExtensionAPI) {
   let runtime: Runtime | undefined;
   let state: PromptState | undefined;
   let gitBranch: string | undefined;
+  let sessionHadImages = false;
   let fallbackTurnCounter = 0;
   let lastPromptText = "";
 
@@ -306,11 +410,15 @@ export default function (pi: ExtensionAPI) {
     if (!state) return;
     closeDanglingObservations("interrupted");
     const { text, meta } = truncateText(state.lastAssistantText ?? "");
+    const media = EMIT_IMAGE_MEDIA ? state.turnImages : [];
+    if (media.length) sessionHadImages = true;
     state.root.update({
+      input: media.length ? { role: "user", content: toMultimodalContent(state.userText, media) } : undefined,
       output: state.lastAssistantText ? { role: "assistant", content: text } : undefined,
       level: state.sawError ? "ERROR" : undefined,
       metadata: {
         assistant_text_meta: meta,
+        ...(state.turnImages.length ? { image_count: state.turnImages.length } : {}),
         ...(opts.cancelled ? { cancelled: true } : {}),
       },
     });
@@ -318,20 +426,31 @@ export default function (pi: ExtensionAPI) {
     state = undefined;
   };
 
-  // Flushing must never block pi's exit or the next prompt indefinitely
+  // Flushing must never block pi's exit or the next prompt indefinitely.
+  // The SDK's forceFlush awaits pending media uploads before the span export,
+  // so a session that uploaded images gets a larger budget on the exit path —
+  // process.exit would abort an in-flight upload and leave a media token
+  // without its binary. Mid-session, timing out is harmless: the process
+  // lives on and the upload finishes in the background.
   const FLUSH_TIMEOUT_MS = 3000;
-  const flush = async () => {
+  const EXIT_FLUSH_WITH_MEDIA_TIMEOUT_MS = 15000;
+  const flush = async (budgetMs: number = FLUSH_TIMEOUT_MS) => {
     if (!runtime) return;
     try {
       let timer: NodeJS.Timeout | undefined;
-      await Promise.race([
-        runtime.processor.forceFlush(),
-        new Promise<void>((resolve) => {
-          timer = setTimeout(resolve, FLUSH_TIMEOUT_MS);
+      const raced = await Promise.race([
+        runtime.processor.forceFlush().then(() => "done" as const),
+        new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), budgetMs);
           timer.unref?.();
         }),
       ]);
       if (timer) clearTimeout(timer);
+      if (raced === "timeout" && sessionHadImages) {
+        console.error(
+          `[pi-langfuse] flush timed out after ${budgetMs}ms with media pending — images may be missing from the trace`,
+        );
+      }
     } catch {
       // Tracing must never break the session.
     }
@@ -358,8 +477,10 @@ export default function (pi: ExtensionAPI) {
 
     const sessionId = ctx.sessionManager.getSessionId();
     const turnNumber = resolveTurnNumber(ctx, event.prompt);
-    lastPromptText = event.prompt;
-    const { text: userText, meta: userMeta } = truncateText(event.prompt);
+    const promptImages = extractImages(event.images);
+    const { text: promptText, meta: userMeta } = truncateText(event.prompt);
+    const userText = [promptText, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
+    lastPromptText = userText;
 
     const root = startObservation(
       ROOT_OBSERVATION_NAME,
@@ -399,6 +520,8 @@ export default function (pi: ExtensionAPI) {
       openTools: new Map(),
       pendingToolResults: [],
       sawError: false,
+      userText,
+      turnImages: [...promptImages],
     };
     debug("root created, turn", turnNumber);
   });
@@ -415,7 +538,7 @@ export default function (pi: ExtensionAPI) {
     const index = ++state.generationCount;
     const generationInput =
       index === 1
-        ? { role: "user", content: truncateText(lastPromptText).text }
+        ? { role: "user", content: lastPromptText }
         : state.pendingToolResults.length
           ? { role: "tool", tool_results: state.pendingToolResults }
           : undefined;
@@ -499,11 +622,29 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_execution_start", (event) => {
     if (!state) return;
+    const maskedArgs = maskSecrets(event.args, []) as Record<string, unknown>;
+    const serializedArgs = safeStringify(maskedArgs);
+    const hasDataUri = /data:[^;,]{0,100};base64,/.test(serializedArgs);
+    let input: unknown = maskedArgs;
+    let argsMeta: TruncationMeta | undefined;
+    if (hasDataUri || serializedArgs.length > MAX_CHARS) {
+      const marked = serializedArgs.replace(
+        /data:[^;,]{0,100};base64,[A-Za-z0-9+/]+=*/g,
+        (uri) => `[data uri ~${Math.floor((uri.length * 3) / 4 / 1024)}KB]`,
+      );
+      const t = truncateText(marked);
+      input = t.text;
+      argsMeta = t.meta;
+    }
     const obs = state.root.startObservation(
       `${TOOL_PREFIX} ${event.toolName}`,
       {
-        input: maskSecrets(event.args, []) as Record<string, unknown>,
-        metadata: { tool_name: event.toolName, tool_id: event.toolCallId },
+        input,
+        metadata: {
+          tool_name: event.toolName,
+          tool_id: event.toolCallId,
+          ...(argsMeta ? { args_meta: argsMeta } : {}),
+        },
       },
       { asType: "tool" },
     );
@@ -517,14 +658,20 @@ export default function (pi: ExtensionAPI) {
     state.openTools.delete(event.toolCallId);
 
     const result = event.result as { content?: unknown } | undefined;
-    const rawOutput = extractText(result?.content) || safeStringify(result?.content);
+    const images = extractImages(result?.content);
+    const rawOutput = renderContentWithImageMarkers(result?.content) || safeStringify(result?.content);
     const { text: outText, meta: outMeta } = truncateText(rawOutput);
     if (event.isError) state.sawError = true;
+    state.turnImages.push(...images);
 
     open.obs.update({
       output: outText || undefined,
       ...(event.isError ? { level: "ERROR" as const, statusMessage: "Tool execution failed" } : {}),
-      metadata: { output_meta: outMeta, is_error: Boolean(event.isError) },
+      metadata: {
+        output_meta: outMeta,
+        is_error: Boolean(event.isError),
+        ...(images.length ? { image_count: images.length } : {}),
+      },
     });
     open.obs.end();
 
@@ -544,7 +691,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (event) => {
     if (state) finalizeRoot({ cancelled: true });
-    await flush();
+    const exitBudget = sessionHadImages ? EXIT_FLUSH_WITH_MEDIA_TIMEOUT_MS : FLUSH_TIMEOUT_MS;
+    await flush(exitBudget);
     if (event.reason === "quit" && runtime && !runtime.shutdown) {
       runtime.shutdown = true;
       try {
@@ -552,7 +700,7 @@ export default function (pi: ExtensionAPI) {
         await Promise.race([
           runtime.provider.shutdown(),
           new Promise<void>((resolve) => {
-            timer = setTimeout(resolve, FLUSH_TIMEOUT_MS);
+            timer = setTimeout(resolve, exitBudget);
             timer.unref?.();
           }),
         ]);
