@@ -6,7 +6,7 @@ import {
   buildCostDetails,
   describeImage,
   extractImages,
-  maskSecrets,
+  createSecretRedactor,
   renderContentWithImageMarkers,
   shortSessionLabel,
   extractToolCalls,
@@ -34,43 +34,66 @@ describe("truncateText", () => {
   });
 });
 
-describe("maskSecrets", () => {
-  it("masks Langfuse key patterns in plain strings", () => {
-    const masked = maskSecrets("key is sk-lf-abc123 and pk-lf-def456", []);
-    assert.equal(masked, "key is [LANGFUSE_KEY_REDACTED] and [LANGFUSE_KEY_REDACTED]");
+describe("createSecretRedactor", () => {
+  it("redacts Langfuse key tokens in plain strings", () => {
+    const redact = createSecretRedactor();
+    assert.equal(
+      redact("key is sk-lf-abc123 and pk-lf-def456"),
+      "key is [redacted-langfuse-secret] and [redacted-langfuse-secret]",
+    );
   });
 
-  it("masks configured literal secrets", () => {
-    const masked = maskSecrets("token: super-secret-token", ["super-secret-token"]);
-    assert.equal(masked, "token: [LANGFUSE_KEY_REDACTED]");
+  it("redacts configured literal secrets", () => {
+    const redact = createSecretRedactor("super-secret-token");
+    assert.equal(redact("token: super-secret-token"), "token: [redacted-langfuse-secret]");
+  });
+
+  it("escapes regex metacharacters in configured secrets", () => {
+    const redact = createSecretRedactor("we+rd(secret)$");
+    assert.equal(redact("x we+rd(secret)$ y"), "x [redacted-langfuse-secret] y");
   });
 
   it("recurses through nested objects and arrays", () => {
-    const masked = maskSecrets({ a: ["sk-lf-x1"], b: { c: "pk-lf-y2" } }, []) as {
+    const redact = createSecretRedactor();
+    const redacted = redact({ a: ["sk-lf-x1"], b: { c: "pk-lf-y2" } }) as {
       a: string[];
       b: { c: string };
     };
-    assert.equal(masked.a[0], "[LANGFUSE_KEY_REDACTED]");
-    assert.equal(masked.b.c, "[LANGFUSE_KEY_REDACTED]");
+    assert.equal(redacted.a[0], "[redacted-langfuse-secret]");
+    assert.equal(redacted.b.c, "[redacted-langfuse-secret]");
   });
 
-  it("survives circular structures", () => {
+  it("collapses circular structures to a marker", () => {
     const obj: Record<string, unknown> = { name: "sk-lf-zzz" };
     obj.self = obj;
-    const masked = maskSecrets(obj, []) as { name: string; self: unknown };
-    assert.equal(masked.name, "[LANGFUSE_KEY_REDACTED]");
-    assert.equal(masked.self, "[circular]");
+    const redact = createSecretRedactor();
+    const redacted = redact(obj) as { name: string; self: unknown };
+    assert.equal(redacted.name, "[redacted-langfuse-secret]");
+    assert.equal(redacted.self, "[circular-ref]");
   });
 
   it("does not falsely flag the same object in two branches as circular", () => {
     const shared = { v: "ok" };
-    const masked = maskSecrets({ a: shared, b: shared }, []) as { a: { v: string }; b: { v: string } };
-    assert.equal(masked.a.v, "ok");
-    assert.equal(masked.b.v, "ok");
+    const redact = createSecretRedactor();
+    const redacted = redact({ a: shared, b: shared }) as { a: { v: string }; b: { v: string } };
+    assert.equal(redacted.a.v, "ok");
+    assert.equal(redacted.b.v, "ok");
+  });
+
+  it("keeps a literal __proto__ key as data instead of touching the prototype", () => {
+    const redact = createSecretRedactor();
+    const payload = JSON.parse('{"__proto__": { "x": "sk-lf-hidden" }, "safe": 1 }');
+    const redacted = redact(payload) as Record<string, unknown>;
+    assert.equal(Object.getPrototypeOf(redacted), Object.prototype);
+    assert.deepEqual(Object.getOwnPropertyDescriptor(redacted, "__proto__")?.value, {
+      x: "[redacted-langfuse-secret]",
+    });
+    assert.equal(redacted.safe, 1);
   });
 
   it("leaves non-strings untouched", () => {
-    assert.deepEqual(maskSecrets({ n: 42, b: true, x: null }, []), { n: 42, b: true, x: null });
+    const redact = createSecretRedactor();
+    assert.deepEqual(redact({ n: 42, b: true, x: null }), { n: 42, b: true, x: null });
   });
 });
 
