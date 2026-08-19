@@ -154,30 +154,46 @@ export function truncateText(text: string): { text: string; meta: TruncationMeta
   };
 }
 
-export function maskSecrets(data: unknown, secrets: readonly string[]): unknown {
-  return maskValue(data, secrets, new WeakSet<object>());
+const SECRET_REDACTION_MARK = "[redacted-langfuse-secret]";
+const CYCLE_MARK = "[circular-ref]";
+const LANGFUSE_KEY_TOKEN = String.raw`\b[sp]k-lf-[\w-]+\b`;
+
+function escapeRegExpLiteral(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function maskValue(data: unknown, secrets: readonly string[], seen: WeakSet<object>): unknown {
-  if (typeof data === "string") {
-    let masked = data.replace(/\b(?:sk|pk)-lf-[A-Za-z0-9_-]+\b/g, "[LANGFUSE_KEY_REDACTED]");
-    for (const secret of secrets) {
-      if (secret) masked = masked.replaceAll(secret, "[LANGFUSE_KEY_REDACTED]");
+/** Redact Langfuse API keys and the given literal secrets from arbitrarily shaped payloads; cycles collapse to a marker so the result survives JSON serialization. */
+export function createSecretRedactor(...extraSecrets: string[]): (value: unknown) => unknown {
+  const alternatives = extraSecrets.filter((s) => s.length > 0).map(escapeRegExpLiteral);
+  alternatives.push(LANGFUSE_KEY_TOKEN);
+  const pattern = new RegExp(alternatives.join("|"), "g");
+  const walk = (value: unknown, ancestors: readonly object[]): unknown => {
+    if (typeof value === "string") return value.replace(pattern, SECRET_REDACTION_MARK);
+    if (value === null || typeof value !== "object") return value;
+    if (ancestors.includes(value)) return CYCLE_MARK;
+    const chain = [...ancestors, value];
+    if (Array.isArray(value)) {
+      const items: unknown[] = [];
+      for (const item of value) items.push(walk(item, chain));
+      return items;
     }
-    return masked;
-  }
-  if (!data || typeof data !== "object") return data;
-  if (seen.has(data)) return "[circular]";
-  seen.add(data);
-  try {
-    if (Array.isArray(data)) return data.map((item) => maskValue(item, secrets, seen));
-    return Object.fromEntries(
-      Object.entries(data).map(([k, v]) => [k, maskValue(v, secrets, seen)]),
-    );
-  } finally {
-    seen.delete(data);
-  }
+    const fields: Record<string, unknown> = {};
+    for (const [key, field] of Object.entries(value)) {
+      // defineProperty, not assignment: a key literally named "__proto__"
+      // must stay a data key instead of mutating the clone's prototype.
+      Object.defineProperty(fields, key, {
+        value: walk(field, chain),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
+    return fields;
+  };
+  return (value) => walk(value, []);
 }
+
+const redactLangfuseKeys = createSecretRedactor();
 
 /** Extract plain text from a pi message content array. */
 export function extractText(content: unknown): string {
@@ -330,17 +346,21 @@ interface Runtime {
   shutdown: boolean;
 }
 
+function isLangfuseSpan(span: { attributes: Record<string, unknown> }): boolean {
+  const observationType = span.attributes["langfuse.observation.type"];
+  return typeof observationType === "string";
+}
+
 function createRuntime(config: LangfuseConfig): Runtime {
-  const secrets = [config.secretKey, config.publicKey];
+  const redactSecrets = createSecretRedactor(config.publicKey, config.secretKey);
   const processor = new LangfuseSpanProcessor({
     publicKey: config.publicKey,
     secretKey: config.secretKey,
     baseUrl: config.baseUrl,
     environment: config.environment,
     release: config.release,
-    mask: ({ data }) => maskSecrets(data, secrets),
-    shouldExportSpan: ({ otelSpan }) =>
-      typeof otelSpan.attributes["langfuse.observation.type"] === "string",
+    mask: ({ data }) => redactSecrets(data),
+    shouldExportSpan: ({ otelSpan }) => isLangfuseSpan(otelSpan),
   });
   const provider = new NodeTracerProvider({
     spanProcessors: [processor],
@@ -696,10 +716,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_execution_start", (event) => {
     if (!state) return;
-    const maskedArgs = maskSecrets(event.args, []) as Record<string, unknown>;
-    const serializedArgs = safeStringify(maskedArgs);
+    const redactedArgs = redactLangfuseKeys(event.args) as Record<string, unknown>;
+    const serializedArgs = safeStringify(redactedArgs);
     const hasDataUri = /data:[^;,]{0,100};base64,/.test(serializedArgs);
-    let input: unknown = maskedArgs;
+    let input: unknown = redactedArgs;
     let argsMeta: TruncationMeta | undefined;
     if (hasDataUri || serializedArgs.length > MAX_CHARS) {
       const marked = serializedArgs.replace(
