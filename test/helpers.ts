@@ -313,16 +313,17 @@ export function runPi(
     child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
     child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
     const killer = setTimeout(() => child.kill("SIGKILL"), 60_000);
-    // A process that cannot start emits "error" and never "close", and the
-    // timer above cannot stop a process that does not exist.
-    child.on("error", (err) => {
+    // A failed spawn emits "error" and then "close", so both handlers run. The
+    // first result must win: only "error" carries the spawn failure.
+    let settled = false;
+    const finish = (status: number | null, spawnError = "") => {
+      if (settled) return;
+      settled = true;
       clearTimeout(killer);
-      resolvePromise({ status: null, stdout, stderr: stderr + String(err) });
-    });
-    child.on("close", (code) => {
-      clearTimeout(killer);
-      resolvePromise({ status: code, stdout, stderr });
-    });
+      resolvePromise({ status, stdout, stderr: stderr + spawnError });
+    };
+    child.on("error", (err) => finish(null, String(err)));
+    child.on("close", (code) => finish(code));
   });
 }
 
