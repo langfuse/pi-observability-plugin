@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   extractText,
+  readInheritedParent,
   buildCostDetails,
   describeImage,
   extractImages,
@@ -307,5 +308,52 @@ describe("malformed image parts (untyped tool results)", () => {
       { type: "text", text: "ok" },
     ]);
     assert.equal(out, "[image unknown type]\n[image image/png]\nok");
+  });
+});
+
+describe("readInheritedParent", () => {
+  const traceId = "0af7651916cd43dd8448eb211c80319c";
+  const spanId = "b7ad6b7169203331";
+
+  it("returns undefined without propagated ids (the normal top-level run)", () => {
+    assert.equal(readInheritedParent({}), undefined);
+  });
+
+  it("reads a remote parent span context plus the parent session", () => {
+    const parent = readInheritedParent({
+      LANGFUSE_PI_PARENT_TRACE_ID: traceId,
+      LANGFUSE_PI_PARENT_SPAN_ID: spanId,
+      LANGFUSE_PI_PARENT_SESSION_ID: "sess-1",
+      LANGFUSE_PI_PARENT_DEPTH: "2",
+    });
+    assert.equal(parent?.spanContext.traceId, traceId);
+    assert.equal(parent?.spanContext.spanId, spanId);
+    assert.equal(parent?.spanContext.isRemote, true);
+    assert.equal(parent?.sessionId, "sess-1");
+    assert.equal(parent?.depth, 2);
+  });
+
+  it("rejects malformed ids instead of attaching spans to a bogus trace", () => {
+    assert.equal(readInheritedParent({ LANGFUSE_PI_PARENT_TRACE_ID: traceId }), undefined);
+    assert.equal(readInheritedParent({ LANGFUSE_PI_PARENT_SPAN_ID: spanId }), undefined);
+    assert.equal(readInheritedParent({ LANGFUSE_PI_PARENT_TRACE_ID: "nope", LANGFUSE_PI_PARENT_SPAN_ID: spanId }), undefined);
+    assert.equal(readInheritedParent({ LANGFUSE_PI_PARENT_TRACE_ID: traceId, LANGFUSE_PI_PARENT_SPAN_ID: "short" }), undefined);
+  });
+
+  it("rejects the all-zero ids that OTel defines as invalid", () => {
+    assert.equal(
+      readInheritedParent({ LANGFUSE_PI_PARENT_TRACE_ID: "0".repeat(32), LANGFUSE_PI_PARENT_SPAN_ID: spanId }),
+      undefined,
+    );
+    assert.equal(
+      readInheritedParent({ LANGFUSE_PI_PARENT_TRACE_ID: traceId, LANGFUSE_PI_PARENT_SPAN_ID: "0".repeat(16) }),
+      undefined,
+    );
+  });
+
+  it("defaults depth to 0 when it is missing or junk", () => {
+    const base = { LANGFUSE_PI_PARENT_TRACE_ID: traceId, LANGFUSE_PI_PARENT_SPAN_ID: spanId };
+    assert.equal(readInheritedParent(base)?.depth, 0);
+    assert.equal(readInheritedParent({ ...base, LANGFUSE_PI_PARENT_DEPTH: "abc" })?.depth, 0);
   });
 });

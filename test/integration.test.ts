@@ -11,6 +11,7 @@ import { after, before, describe, it } from "node:test";
 import {
   type Capture,
   type CapturedSpan,
+  REPO_ROOT,
   createSandbox,
   runPi,
   startCaptureServer,
@@ -174,6 +175,82 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       assert.equal(result.status, 0);
       await new Promise((r) => setTimeout(r, 1500));
       assert.equal(capture.requests.length, 0, "no exports with the kill switch on");
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("nests a spawned subagent into the parent trace instead of orphaning it", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const result = await runPi(sandbox, "Delegate the repo inspection, then summarize", {
+        env: buildLangfuseEnv(capture),
+        extensions: [join(REPO_ROOT, "test", "fixtures", "subagent-tool.ts")],
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+      // The parent and the child export separately. Wait for the two exports.
+      await waitForRequests(capture, 2, 15_000);
+      const spans = capture.spans();
+
+      const parentRoot = findSpansByName(spans, "Conversational Turn")[0];
+      const subagentRoot = findSpansByName(spans, "Subagent Turn")[0];
+      assert.ok(parentRoot, "parent turn must be traced");
+      assert.ok(subagentRoot, "subagent turn must be traced");
+
+      // The child must join the parent trace.
+      assert.equal(subagentRoot!.traceId, parentRoot!.traceId, "subagent must share the parent's trace id");
+      assert.equal(
+        subagentRoot!.parentSpanId,
+        parentRoot!.spanId,
+        "subagent root must be a child of the parent turn root",
+      );
+      assert.equal(parentRoot!.parentSpanId, undefined, "the parent turn stays the trace root");
+
+      // Only the real root sets the trace fields.
+      assert.ok(parentRoot!.attrs["langfuse.trace.name"], "parent owns the trace name");
+      assert.equal(
+        subagentRoot!.attrs["langfuse.trace.name"],
+        undefined,
+        "subagent must not overwrite the trace name it is nested into",
+      );
+      assert.equal(subagentRoot!.attrs["session.id"], undefined, "subagent must not set the session");
+      assert.equal(subagentRoot!.attrs["user.id"], undefined, "subagent must not set the user");
+      assert.equal(subagentRoot!.attrs["langfuse.trace.tags"], undefined, "subagent must not set tags");
+      const meta = (k: string) => subagentRoot!.attrs[`langfuse.observation.metadata.${k}`];
+      assert.equal(String(meta("pi_subagent")), "true");
+      assert.equal(Number(meta("subagent_depth")), 1);
+
+      // The model calls of the subagent go in the same trace. Their tokens add
+      // to the parent totals.
+      const subagentChildren = spans.filter((s) => s.parentSpanId === subagentRoot!.spanId);
+      assert.ok(
+        subagentChildren.some((s) => s.attrs["langfuse.observation.type"] === "generation"),
+        "the subagent's generations must be nested under it",
+      );
+      for (const span of subagentChildren) {
+        assert.equal(span.traceId, parentRoot!.traceId, `${span.name} must stay in the parent trace`);
+      }
+
+      assert.ok(findSpansByName(spans, "Tool: subagent")[0], "the delegating tool call must be traced");
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("publishes the parent context only while the turn is active", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const result = await runPi(sandbox, "Explore this project and summarize it", {
+        env: buildLangfuseEnv(capture),
+        extensions: [join(REPO_ROOT, "test", "fixtures", "env-probe.ts")],
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+      // The probe runs after our extension, so the withdraw has already happened
+      // when it prints at agent_settled.
+      assert.match(result.stderr, /PROBE turn [0-9a-f]{32}/, "parent ids must be published during the turn");
+      assert.match(result.stderr, /PROBE settled <unset>/, "parent ids must be withdrawn after the turn");
     } finally {
       capture.close();
     }

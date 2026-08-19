@@ -73,3 +73,19 @@ For a script, close the standard input in print mode: `pi -p "..." < /dev/null`.
 pi waits for the end of the file on a piped standard input.
 
 `PI_LANGFUSE_DEBUG=true` writes the steps of the extension to the standard error.
+
+## Subagent nesting
+
+A pi subagent is a second pi process. The subagent example extension starts one
+for each task, and so do the gallery orchestration packages. A child process gets
+the environment of its parent.
+
+While a turn is active, the extension puts the ids of that turn in the
+environment: `LANGFUSE_PI_PARENT_TRACE_ID`, `LANGFUSE_PI_PARENT_SPAN_ID`,
+`LANGFUSE_PI_PARENT_SESSION_ID` and `LANGFUSE_PI_PARENT_DEPTH`. A pi process that
+finds these ids puts its trace below the turn that started it. Without them, the
+child writes a separate trace.
+
+You can also set these variables yourself to attach a run to a trace from
+another tool. The ids must belong to the same Langfuse project that the run
+exports to. The built-in flow needs no configuration.
