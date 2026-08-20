@@ -22,6 +22,7 @@ const SUBAGENT_ROOT_OBSERVATION_NAME = "Subagent Turn";
 const GENERATION_PREFIX = "LLM Call";
 const TOOL_PREFIX = "Tool:";
 const COMPACTION_OBSERVATION_NAME = "Compaction";
+const BRANCH_SUMMARY_OBSERVATION_NAME = "Branch Summary";
 const BASE_TAGS = ["pi"];
 const MAX_CHARS = Number(process.env.PI_LANGFUSE_MAX_CHARS ?? "20000");
 
@@ -902,6 +903,36 @@ export default function (pi: ExtensionAPI) {
       startedAt,
     );
     debug("compaction traced", usage?.input, usage?.output, usage?.cost?.total);
+  });
+
+  // Branch summaries (session tree navigation) are the second slice of pi's
+  // "Tools/summaries" bucket: a real summarization call whose usage lands on
+  // the BranchSummaryEntry that session_tree exposes.
+  pi.on("session_tree", (event, ctx) => {
+    const entry = event.summaryEntry as
+      | { summary?: string; usage?: PiUsage; fromHook?: boolean }
+      | undefined;
+    if (!entry) return; // plain navigation without a summarization call
+    const usage = entry.usage;
+    const { text: summaryText, meta: summaryMeta } = truncateText(entry.summary ?? "");
+    emitSummarizationGeneration(
+      BRANCH_SUMMARY_OBSERVATION_NAME,
+      ctx,
+      {
+        output: summaryText ? { role: "assistant", content: summaryText } : undefined,
+        model: ctx.model?.id,
+        usageDetails: usage ? buildUsageDetails(usage) : undefined,
+        costDetails: usage ? buildCostDetails(usage) : undefined,
+        metadata: {
+          ...(event.fromExtension ? { from_extension: true } : {}),
+          ...(entry.fromHook ? { from_hook: true } : {}),
+          ...(usage?.cacheWrite1h ? { cache_write_1h_tokens: usage.cacheWrite1h } : {}),
+          ...(ctx.model ? { provider: ctx.model.provider } : {}),
+          summary_meta: summaryMeta,
+        },
+      },
+    );
+    debug("branch summary traced", usage?.input, usage?.output, usage?.cost?.total);
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
