@@ -178,6 +178,70 @@ describe("buildUsageDetails / buildCostDetails", () => {
     }
   });
 
+  // Asserting only cost ⊆ usage let the reasoning split ship a usage bucket
+  // with no cost bucket, so the mirror must hold in both directions.
+  it("mirrors usage and cost keys in both directions, reasoning included", () => {
+    const withReasoning: PiUsage = {
+      input: 500,
+      output: 300,
+      cacheRead: 100,
+      cacheWrite: 50,
+      reasoning: 200,
+      cost: { input: 0.001, output: 0.003, cacheRead: 0.00002, cacheWrite: 0.0001875, total: 0.0042075 },
+    };
+    const usageKeys = Object.keys(buildUsageDetails(withReasoning) ?? {}).sort();
+    const costKeys = Object.keys(buildCostDetails(withReasoning) ?? {})
+      .filter((k) => k !== "total")
+      .sort();
+    assert.deepEqual(costKeys, usageKeys);
+  });
+
+  it("splits the output cost proportionally and keeps the total exact", () => {
+    const details = buildCostDetails({
+      input: 500,
+      output: 300,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoning: 200,
+      cost: { input: 0.001, output: 0.003, cacheRead: 0, cacheWrite: 0, total: 0.004 },
+    });
+    // $0.003 for 300 tokens = $0.00001/token: 100 -> $0.001, 200 -> $0.002.
+    assert.ok(Math.abs((details?.output ?? 0) - 0.001) < 1e-12);
+    assert.ok(Math.abs((details?.output_reasoning_tokens ?? 0) - 0.002) < 1e-12);
+    // Derived by subtraction, so the two buckets must re-sum exactly.
+    assert.equal((details?.output ?? 0) + (details?.output_reasoning_tokens ?? 0), 0.003);
+  });
+
+  it("implies the same per-token rate for both output buckets", () => {
+    const usageWithReasoning: PiUsage = {
+      input: 0,
+      output: 587,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoning: 229,
+      cost: { input: 0, output: 0.008805, cacheRead: 0, cacheWrite: 0, total: 0.008805 },
+    };
+    const u = buildUsageDetails(usageWithReasoning) ?? {};
+    const c = buildCostDetails(usageWithReasoning) ?? {};
+    const outputRate = (c.output ?? 0) / (u.output ?? 1);
+    const reasoningRate = (c.output_reasoning_tokens ?? 0) / (u.output_reasoning_tokens ?? 1);
+    assert.ok(Math.abs(outputRate - reasoningRate) < 1e-15, `${outputRate} != ${reasoningRate}`);
+    // 15 USD / 1M tokens, the mock rate card.
+    assert.ok(Math.abs(outputRate - 15 / 1e6) < 1e-15);
+  });
+
+  it("prices the whole output under one key when the reasoning count is inconsistent", () => {
+    const details = buildCostDetails({
+      input: 0,
+      output: 100,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoning: 300,
+      cost: { input: 0, output: 0.0015, cacheRead: 0, cacheWrite: 0, total: 0.0015 },
+    });
+    assert.deepEqual(details, { total: 0.0015, output: 0.0015 });
+  });
+
   it("omits cost details entirely when pi has no pricing (server-side pricing takes over)", () => {
     assert.equal(buildCostDetails({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }), undefined);
     assert.equal(

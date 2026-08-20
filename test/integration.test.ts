@@ -13,6 +13,7 @@ import {
   type CapturedSpan,
   REPO_ROOT,
   createSandbox,
+  SUMMARIZATION_USAGE,
   runPi,
   startCaptureServer,
   startMockProvider,
@@ -274,6 +275,51 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       const root = findSpansByName(capture.spans(), "Conversational Turn")[0];
       assert.ok(root, "config-file-only run must export a trace");
       assert.equal(root!.attrs["user.id"], "file-user");
+    } finally {
+      capture.close();
+    }
+  });
+
+  // Compaction calls the provider through completeSummarization, bypassing the
+  // agent loop, so no message_end fires — yet pi still books the tokens.
+  it("traces the compaction summarization call so the session total matches pi", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port, {
+        contextWindow: 18000, // minus reserveTokens 16384 -> threshold 1616
+        keepRecentTokens: 300,
+        readmeFillerLines: 200,
+      });
+      const result = await runPi(sandbox, "Explore this project and summarize it", {
+        env: buildLangfuseEnv(capture),
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+      await waitForRequests(capture, 1);
+      const spans = capture.spans();
+
+      const compactions = findSpansByName(spans, "Compaction");
+      assert.equal(compactions.length, 1, "the compaction summarization call must be traced");
+      const compaction = compactions[0]!;
+      assert.equal(compaction.attrs["langfuse.observation.type"], "generation");
+
+      const usage = JSON.parse(String(compaction.attrs["langfuse.observation.usage_details"]));
+      assert.deepEqual(usage, {
+        input: SUMMARIZATION_USAGE.prompt,
+        output: SUMMARIZATION_USAGE.completion,
+      });
+      const cost = JSON.parse(String(compaction.attrs["langfuse.observation.cost_details"]));
+      // 3571 input at $3/M + 313 output at $15/M, the sandbox rate card.
+      const expected = (3 / 1e6) * SUMMARIZATION_USAGE.prompt + (15 / 1e6) * SUMMARIZATION_USAGE.completion;
+      assert.ok(Math.abs(cost.total - expected) < 1e-12, `${cost.total} != ${expected}`);
+
+      // A dropped startTime would collapse the span to ~0.
+      assert.ok(compaction.endNs > compaction.startNs, "compaction span must have a duration");
+
+      // Nested under the turn root when the compaction happens inside a turn.
+      const root = findSpansByName(spans, "Conversational Turn")[0]!;
+      assert.equal(compaction.parentSpanId, root.spanId);
+      assert.equal(compaction.traceId, root.traceId);
+      assert.equal(compaction.attrs["langfuse.observation.metadata.compaction_reason"], "threshold");
     } finally {
       capture.close();
     }

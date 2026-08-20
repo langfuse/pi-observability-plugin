@@ -13,14 +13,17 @@ import {
   startObservation,
 } from "@langfuse/tracing";
 import { type SpanContext, TraceFlags } from "@opentelemetry/api";
-import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import { AlwaysOnSampler, NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 
 const EXTENSION_NAME = "@langfuse/pi-observability-plugin";
 const EXTENSION_VERSION = "0.0.1";
 const ROOT_OBSERVATION_NAME = "Conversational Turn";
 const SUBAGENT_ROOT_OBSERVATION_NAME = "Subagent Turn";
-const GENERATION_PREFIX = "LLM Call"; 
+const GENERATION_PREFIX = "LLM Call";
 const TOOL_PREFIX = "Tool:";
+const COMPACTION_OBSERVATION_NAME = "Compaction";
+const BRANCH_SUMMARY_OBSERVATION_NAME = "Branch Summary";
+const TOOL_USAGE_OBSERVATION_NAME = "Tool LLM Usage";
 const BASE_TAGS = ["pi"];
 const MAX_CHARS = Number(process.env.PI_LANGFUSE_MAX_CHARS ?? "20000");
 
@@ -299,7 +302,23 @@ export interface PiUsage {
   cacheRead: number;
   cacheWrite: number;
   reasoning?: number;
+  /** Subset of `cacheWrite`. Only Anthropic reports it. */
+  cacheWrite1h?: number;
   cost?: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+}
+
+/**
+ * Whether the reasoning tokens can be split out of `output`.
+ *
+ * pi reports `reasoning` as a subset of `output`. A provider that reports more
+ * reasoning than output would make the split produce a negative bucket, so both
+ * {@link buildUsageDetails} and {@link buildCostDetails} fall back to a single
+ * `output` bucket in that case. They MUST agree, otherwise a usage bucket ends
+ * up without its cost counterpart.
+ */
+function resolveReasoningSplit(usage: PiUsage): { reasoning: number; canSplit: boolean } {
+  const reasoning = usage.reasoning ?? 0;
+  return { reasoning, canSplit: reasoning > 0 && reasoning <= usage.output };
 }
 
 /**
@@ -309,13 +328,10 @@ export interface PiUsage {
 export function buildUsageDetails(usage: PiUsage): Record<string, number> | undefined {
   const details: Record<string, number> = {};
   if (usage.input > 0) details.input = usage.input;
-  // Do not split when a provider reports more reasoning than output tokens.
-  // A count that is too large makes the total wrong.
-  const reasoning = usage.reasoning ?? 0;
-  const canSplitReasoning = reasoning > 0 && reasoning <= usage.output;
-  const output = canSplitReasoning ? usage.output - reasoning : usage.output;
+  const { reasoning, canSplit } = resolveReasoningSplit(usage);
+  const output = canSplit ? usage.output - reasoning : usage.output;
   if (output > 0) details.output = output;
-  if (canSplitReasoning) details.output_reasoning_tokens = reasoning;
+  if (canSplit) details.output_reasoning_tokens = reasoning;
   if (usage.cacheRead > 0) details.cache_read_input_tokens = usage.cacheRead;
   if (usage.cacheWrite > 0) details.cache_creation_input_tokens = usage.cacheWrite;
   return Object.keys(details).length ? details : undefined;
@@ -323,14 +339,30 @@ export function buildUsageDetails(usage: PiUsage): Record<string, number> | unde
 
 /**
  * Cost keys must mirror the usage keys ({@link buildUsageDetails}) — Langfuse
- * joins the two by name, and server-side pricing emits the same spellings.
+ * joins the two by name, and server-side pricing emits the same spellings. A
+ * usage bucket without its cost twin makes the bucket's implied per-token rate
+ * wrong in the UI even though the total stays correct.
  */
 export function buildCostDetails(usage: PiUsage): Record<string, number> | undefined {
   const cost = usage.cost;
   if (!cost || !(cost.total > 0)) return undefined;
   const details: Record<string, number> = { total: cost.total };
   if (cost.input > 0) details.input = cost.input;
-  if (cost.output > 0) details.output = cost.output;
+  if (cost.output > 0) {
+    // pi prices every output token of a call at one rate (its tier selection
+    // reads only input-side tokens), so the reasoning share is exactly
+    // proportional. Deriving the non-reasoning bucket by subtraction keeps the
+    // two buckets summing bit-for-bit to the total pi reported.
+    const { reasoning, canSplit } = resolveReasoningSplit(usage);
+    if (canSplit) {
+      const reasoningCost = cost.output * (reasoning / usage.output);
+      const nonReasoningCost = cost.output - reasoningCost;
+      if (nonReasoningCost > 0) details.output = nonReasoningCost;
+      if (reasoningCost > 0) details.output_reasoning_tokens = reasoningCost;
+    } else {
+      details.output = cost.output;
+    }
+  }
   if (cost.cacheRead > 0) details.cache_read_input_tokens = cost.cacheRead;
   if (cost.cacheWrite > 0) details.cache_creation_input_tokens = cost.cacheWrite;
   return details;
@@ -364,10 +396,8 @@ function createRuntime(config: LangfuseConfig): Runtime {
   });
   const provider = new NodeTracerProvider({
     spanProcessors: [processor],
-    // OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT etc. must not apply here: a cut data
-    // URI still matches the media regex and uploads garbage. Payload size is
-    // bounded by our own truncateText instead.
-    spanLimits: { attributeValueLengthLimit: Infinity },
+    sampler: new AlwaysOnSampler(),
+    spanLimits: { attributeValueLengthLimit: Infinity, attributeCountLimit: Infinity },
   });
   setLangfuseTracerProvider(provider);
   return { processor, provider, shutdown: false };
@@ -389,7 +419,7 @@ interface PromptState {
   turnNumber: number;
   generationCount: number;
   openGeneration?: OpenGeneration;
-  openTools: Map<string, { obs: LangfuseTool; name: string }>;
+  openTools: Map<string, { obs: LangfuseTool; name: string; startedAt: Date }>;
   pendingToolResults: Array<{ tool_call_id: string; name: string; content: string }>;
   lastAssistantText?: string;
   sawError: boolean;
@@ -420,6 +450,7 @@ export default function (pi: ExtensionAPI) {
   let sessionHadImages = false;
   let fallbackTurnCounter = 0;
   let lastPromptText = "";
+  let compactionStartedAt: Date | undefined;
   const inheritedParent = readInheritedParent();
   const inheritedParentEnv: Record<string, string | undefined> = {
     [ENV_PARENT_TRACE_ID]: process.env[ENV_PARENT_TRACE_ID],
@@ -667,6 +698,7 @@ export default function (pi: ExtensionAPI) {
       role: string;
       content?: unknown;
       model?: string;
+      responseModel?: string;
       provider?: string;
       api?: string;
       responseId?: string;
@@ -690,7 +722,7 @@ export default function (pi: ExtensionAPI) {
         ...(outText ? { content: outText } : {}),
         ...(tools.length ? { tool_calls: tools } : {}),
       },
-      model: message.model,
+      model: message.responseModel || message.model,
       usageDetails: message.usage ? buildUsageDetails(message.usage) : undefined,
       costDetails: message.usage ? buildCostDetails(message.usage) : undefined,
       ...(isError
@@ -705,6 +737,10 @@ export default function (pi: ExtensionAPI) {
         ...(message.stopReason ? { stop_reason: message.stopReason } : {}),
         ...(message.responseId ? { response_id: message.responseId } : {}),
         ...(message.api ? { api: message.api } : {}),
+        ...(message.responseModel && message.responseModel !== message.model
+          ? { requested_model: message.model }
+          : {}),
+        ...(message.usage?.cacheWrite1h ? { cache_write_1h_tokens: message.usage.cacheWrite1h } : {}),
       },
     });
     gen.obs.end();
@@ -742,21 +778,49 @@ export default function (pi: ExtensionAPI) {
       },
       { asType: "tool" },
     );
-    state.openTools.set(event.toolCallId, { obs, name: event.toolName });
+    state.openTools.set(event.toolCallId, { obs, name: event.toolName, startedAt: new Date() });
   });
 
-  pi.on("tool_execution_end", (event) => {
+  pi.on("tool_execution_end", (event, ctx) => {
     if (!state) return;
     const open = state.openTools.get(event.toolCallId);
     if (!open) return;
     state.openTools.delete(event.toolCallId);
 
-    const result = event.result as { content?: unknown } | undefined;
+    const result = event.result as { content?: unknown; usage?: PiUsage } | undefined;
     const images = extractImages(result?.content);
     const rawOutput = renderContentWithImageMarkers(result?.content) || safeStringify(result?.content);
     const { text: outText, meta: outMeta } = truncateText(rawOutput);
     if (event.isError) state.sawError = true;
     state.turnImages.push(...images);
+
+    if (result?.usage) {
+      const usageObs = startObservation(
+        TOOL_USAGE_OBSERVATION_NAME,
+        {
+          usageDetails: buildUsageDetails(result.usage),
+          costDetails: buildCostDetails(result.usage),
+          // Best effort: pi does not record which model the tool used
+          // internally. The session model keeps the no-cost fallback priceable;
+          // the flag below marks the attribution as approximate.
+          model: ctx.model?.id,
+          metadata: {
+            tool_call_id: event.toolCallId,
+            tool_name: open.name,
+            source: "tool_result_usage",
+            model_is_session_model: true,
+            ...(result.usage.cacheWrite1h ? { cache_write_1h_tokens: result.usage.cacheWrite1h } : {}),
+          },
+        },
+        {
+          asType: "generation",
+          parentSpanContext: open.obs.otelSpan.spanContext(),
+          startTime: open.startedAt,
+        },
+      );
+      usageObs.end();
+      debug("tool result usage traced", open.name, result.usage.input, result.usage.output);
+    }
 
     open.obs.update({
       output: outText || undefined,
@@ -774,6 +838,130 @@ export default function (pi: ExtensionAPI) {
       name: open.name,
       content: outText.slice(0, 4000),
     });
+  });
+
+  const emitSummarizationGeneration = (
+    name: string,
+    ctx: ExtensionContext,
+    attributes: {
+      output?: { role: string; content: string };
+      model?: string;
+      usageDetails?: Record<string, number>;
+      costDetails?: Record<string, number>;
+      metadata: Record<string, unknown>;
+    },
+    startedAt?: Date,
+  ): void => {
+    if (state) {
+      const obs = startObservation(name, attributes, {
+        asType: "generation",
+        parentSpanContext: state.root.otelSpan.spanContext(),
+        ...(startedAt ? { startTime: startedAt } : {}),
+      });
+      obs.end();
+      return;
+    }
+    // ensureRuntime is otherwise only called in before_agent_start; an idle
+    // /compact in a fresh process would hit the unset tracer provider.
+    ensureRuntime();
+    const sessionId = ctx.sessionManager.getSessionId();
+    const obs = startObservation(
+      name,
+      {
+        ...attributes,
+        metadata: {
+          ...attributes.metadata,
+          source: "pi",
+          extension: EXTENSION_NAME,
+          extension_version: EXTENSION_VERSION,
+          session_id: sessionId,
+        },
+      },
+      {
+        asType: "generation",
+        ...(startedAt ? { startTime: startedAt } : {}),
+        ...(inheritedParent ? { parentSpanContext: inheritedParent.spanContext } : {}),
+      },
+    );
+    if (!inheritedParent) {
+      obs.otelSpan.setAttribute(
+        LangfuseOtelSpanAttributes.TRACE_NAME,
+        `Pi - ${name} (${shortSessionLabel(sessionId)})`,
+      );
+      obs.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_SESSION_ID, sessionId);
+      obs.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_TAGS, BASE_TAGS);
+      if (config.userId) {
+        obs.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_USER_ID, config.userId);
+      }
+    }
+    obs.end();
+    void flush();
+  }
+
+  pi.on("session_before_compact", () => {
+    compactionStartedAt = new Date();
+  });
+
+  pi.on("session_compact", (event, ctx) => {
+    const startedAt = compactionStartedAt;
+    compactionStartedAt = undefined;
+    const entry = event.compactionEntry as
+      | { summary?: string; tokensBefore?: number; usage?: PiUsage; fromHook?: boolean }
+      | undefined;
+    const usage = entry?.usage;
+    const { text: summaryText, meta: summaryMeta } = truncateText(entry?.summary ?? "");
+    emitSummarizationGeneration(
+      COMPACTION_OBSERVATION_NAME,
+      ctx,
+      {
+        output: summaryText ? { role: "assistant", content: summaryText } : undefined,
+        model: ctx.model?.id,
+        usageDetails: usage ? buildUsageDetails(usage) : undefined,
+        costDetails: usage ? buildCostDetails(usage) : undefined,
+        metadata: {
+          compaction_reason: event.reason,
+          will_retry: event.willRetry,
+          from_extension: event.fromExtension,
+          ...(usage?.cacheWrite1h ? { cache_write_1h_tokens: usage.cacheWrite1h } : {}),
+          ...(entry?.fromHook ? { from_hook: true } : {}),
+          ...(typeof entry?.tokensBefore === "number" ? { tokens_before: entry.tokensBefore } : {}),
+          ...(ctx.model ? { provider: ctx.model.provider } : {}),
+          summary_meta: summaryMeta,
+        },
+      },
+      startedAt,
+    );
+    debug("compaction traced", usage?.input, usage?.output, usage?.cost?.total);
+  });
+
+  // Branch summaries (session tree navigation) are the second slice of pi's
+  // "Tools/summaries" bucket: a real summarization call whose usage lands on
+  // the BranchSummaryEntry that session_tree exposes.
+  pi.on("session_tree", (event, ctx) => {
+    const entry = event.summaryEntry as
+      | { summary?: string; usage?: PiUsage; fromHook?: boolean }
+      | undefined;
+    if (!entry) return; // plain navigation without a summarization call
+    const usage = entry.usage;
+    const { text: summaryText, meta: summaryMeta } = truncateText(entry.summary ?? "");
+    emitSummarizationGeneration(
+      BRANCH_SUMMARY_OBSERVATION_NAME,
+      ctx,
+      {
+        output: summaryText ? { role: "assistant", content: summaryText } : undefined,
+        model: ctx.model?.id,
+        usageDetails: usage ? buildUsageDetails(usage) : undefined,
+        costDetails: usage ? buildCostDetails(usage) : undefined,
+        metadata: {
+          ...(event.fromExtension ? { from_extension: true } : {}),
+          ...(entry.fromHook ? { from_hook: true } : {}),
+          ...(usage?.cacheWrite1h ? { cache_write_1h_tokens: usage.cacheWrite1h } : {}),
+          ...(ctx.model ? { provider: ctx.model.provider } : {}),
+          summary_meta: summaryMeta,
+        },
+      },
+    );
+    debug("branch summary traced", usage?.input, usage?.output, usage?.cost?.total);
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
