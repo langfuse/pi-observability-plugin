@@ -692,6 +692,7 @@ export default function (pi: ExtensionAPI) {
       role: string;
       content?: unknown;
       model?: string;
+      responseModel?: string;
       provider?: string;
       api?: string;
       responseId?: string;
@@ -715,7 +716,7 @@ export default function (pi: ExtensionAPI) {
         ...(outText ? { content: outText } : {}),
         ...(tools.length ? { tool_calls: tools } : {}),
       },
-      model: message.model,
+      model: message.responseModel || message.model,
       usageDetails: message.usage ? buildUsageDetails(message.usage) : undefined,
       costDetails: message.usage ? buildCostDetails(message.usage) : undefined,
       ...(isError
@@ -730,6 +731,9 @@ export default function (pi: ExtensionAPI) {
         ...(message.stopReason ? { stop_reason: message.stopReason } : {}),
         ...(message.responseId ? { response_id: message.responseId } : {}),
         ...(message.api ? { api: message.api } : {}),
+        ...(message.responseModel && message.responseModel !== message.model
+          ? { requested_model: message.model }
+          : {}),
       },
     });
     gen.obs.end();
