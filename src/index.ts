@@ -299,6 +299,8 @@ export interface PiUsage {
   cacheRead: number;
   cacheWrite: number;
   reasoning?: number;
+  /** Subset of `cacheWrite`. Only Anthropic reports it. */
+  cacheWrite1h?: number;
   cost?: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
 }
 
@@ -734,6 +736,7 @@ export default function (pi: ExtensionAPI) {
         ...(message.responseModel && message.responseModel !== message.model
           ? { requested_model: message.model }
           : {}),
+        ...(message.usage?.cacheWrite1h ? { cache_write_1h_tokens: message.usage.cacheWrite1h } : {}),
       },
     });
     gen.obs.end();
