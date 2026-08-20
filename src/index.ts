@@ -13,7 +13,7 @@ import {
   startObservation,
 } from "@langfuse/tracing";
 import { type SpanContext, TraceFlags } from "@opentelemetry/api";
-import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import { AlwaysOnSampler, NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 
 const EXTENSION_NAME = "@langfuse/pi-observability-plugin";
 const EXTENSION_VERSION = "0.0.1";
@@ -391,10 +391,8 @@ function createRuntime(config: LangfuseConfig): Runtime {
   });
   const provider = new NodeTracerProvider({
     spanProcessors: [processor],
-    // OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT etc. must not apply here: a cut data
-    // URI still matches the media regex and uploads garbage. Payload size is
-    // bounded by our own truncateText instead.
-    spanLimits: { attributeValueLengthLimit: Infinity },
+    sampler: new AlwaysOnSampler(),
+    spanLimits: { attributeValueLengthLimit: Infinity, attributeCountLimit: Infinity },
   });
   setLangfuseTracerProvider(provider);
   return { processor, provider, shutdown: false };
