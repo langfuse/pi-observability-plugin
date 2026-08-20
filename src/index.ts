@@ -23,6 +23,7 @@ const GENERATION_PREFIX = "LLM Call";
 const TOOL_PREFIX = "Tool:";
 const COMPACTION_OBSERVATION_NAME = "Compaction";
 const BRANCH_SUMMARY_OBSERVATION_NAME = "Branch Summary";
+const TOOL_USAGE_OBSERVATION_NAME = "Tool LLM Usage";
 const BASE_TAGS = ["pi"];
 const MAX_CHARS = Number(process.env.PI_LANGFUSE_MAX_CHARS ?? "20000");
 
@@ -418,7 +419,7 @@ interface PromptState {
   turnNumber: number;
   generationCount: number;
   openGeneration?: OpenGeneration;
-  openTools: Map<string, { obs: LangfuseTool; name: string }>;
+  openTools: Map<string, { obs: LangfuseTool; name: string; startedAt: Date }>;
   pendingToolResults: Array<{ tool_call_id: string; name: string; content: string }>;
   lastAssistantText?: string;
   sawError: boolean;
@@ -777,21 +778,49 @@ export default function (pi: ExtensionAPI) {
       },
       { asType: "tool" },
     );
-    state.openTools.set(event.toolCallId, { obs, name: event.toolName });
+    state.openTools.set(event.toolCallId, { obs, name: event.toolName, startedAt: new Date() });
   });
 
-  pi.on("tool_execution_end", (event) => {
+  pi.on("tool_execution_end", (event, ctx) => {
     if (!state) return;
     const open = state.openTools.get(event.toolCallId);
     if (!open) return;
     state.openTools.delete(event.toolCallId);
 
-    const result = event.result as { content?: unknown } | undefined;
+    const result = event.result as { content?: unknown; usage?: PiUsage } | undefined;
     const images = extractImages(result?.content);
     const rawOutput = renderContentWithImageMarkers(result?.content) || safeStringify(result?.content);
     const { text: outText, meta: outMeta } = truncateText(rawOutput);
     if (event.isError) state.sawError = true;
     state.turnImages.push(...images);
+
+    if (result?.usage) {
+      const usageObs = startObservation(
+        TOOL_USAGE_OBSERVATION_NAME,
+        {
+          usageDetails: buildUsageDetails(result.usage),
+          costDetails: buildCostDetails(result.usage),
+          // Best effort: pi does not record which model the tool used
+          // internally. The session model keeps the no-cost fallback priceable;
+          // the flag below marks the attribution as approximate.
+          model: ctx.model?.id,
+          metadata: {
+            tool_call_id: event.toolCallId,
+            tool_name: open.name,
+            source: "tool_result_usage",
+            model_is_session_model: true,
+            ...(result.usage.cacheWrite1h ? { cache_write_1h_tokens: result.usage.cacheWrite1h } : {}),
+          },
+        },
+        {
+          asType: "generation",
+          parentSpanContext: open.obs.otelSpan.spanContext(),
+          startTime: open.startedAt,
+        },
+      );
+      usageObs.end();
+      debug("tool result usage traced", open.name, result.usage.input, result.usage.output);
+    }
 
     open.obs.update({
       output: outText || undefined,
