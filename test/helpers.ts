@@ -72,6 +72,9 @@ function streamChunks(
   res.end();
 }
 
+/** Usage the mock reports for a compaction/branch summarization call. */
+export const SUMMARIZATION_USAGE = { prompt: 3571, completion: 313 };
+
 export function startMockProvider(): Promise<{ port: number; close: () => void }> {
   const server = http.createServer((req, res) => {
     let body = "";
@@ -102,6 +105,17 @@ export function startMockProvider(): Promise<{ port: number; close: () => void }
         prompt_tokens_details: { cached_tokens: cached },
         completion_tokens_details: { reasoning_tokens: reasoning },
       });
+
+      // Both compaction paths wrap the history in <conversation> tags before
+      // calling completeSummarization, which bypasses the agent loop.
+      if (JSON.stringify(messages).includes("<conversation>")) {
+        streamChunks(res, model, {
+          text: "Summary of the earlier work.",
+          finish: "stop",
+          usage: usage(SUMMARIZATION_USAGE.prompt, SUMMARIZATION_USAGE.completion, 0),
+        });
+        return;
+      }
 
       if (canDelegate && stage === 0) {
         streamChunks(res, model, {
@@ -255,10 +269,27 @@ export interface Sandbox {
   workspace: string;
 }
 
-export function createSandbox(mockPort: number): Sandbox {
+/**
+ * Options that force a threshold compaction. Both are needed, else compaction
+ * is a silent no-op: the window trips shouldCompact, keepRecentTokens the cut.
+ */
+export interface SandboxOptions {
+  contextWindow?: number;
+  keepRecentTokens?: number;
+  /** Pads README.md so reading it grows the context past keepRecentTokens. */
+  readmeFillerLines?: number;
+}
+
+export function createSandbox(mockPort: number, opts: SandboxOptions = {}): Sandbox {
   const agentDir = mkdtempSync(join(tmpdir(), "pi-lf-agent-"));
   const workspace = mkdtempSync(join(tmpdir(), "pi-lf-ws-"));
-  writeFileSync(join(workspace, "README.md"), "# Test workspace\nUsed by integration tests.\n");
+  const filler = "This paragraph is filler so the tool result grows the context. ".repeat(
+    opts.readmeFillerLines ?? 0,
+  );
+  writeFileSync(
+    join(workspace, "README.md"),
+    `# Test workspace\nUsed by integration tests.\n${filler}`,
+  );
   writeFileSync(
     join(agentDir, "models.json"),
     JSON.stringify({
@@ -274,7 +305,7 @@ export function createSandbox(mockPort: number): Sandbox {
               name: "Mock GPT 1",
               reasoning: false,
               input: ["text"],
-              contextWindow: 128000,
+              contextWindow: opts.contextWindow ?? 128000,
               maxTokens: 8192,
               cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
             },
@@ -283,6 +314,14 @@ export function createSandbox(mockPort: number): Sandbox {
       },
     }),
   );
+  if (opts.keepRecentTokens !== undefined) {
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({
+        compaction: { enabled: true, reserveTokens: 16384, keepRecentTokens: opts.keepRecentTokens },
+      }),
+    );
+  }
   return { agentDir, workspace };
 }
 

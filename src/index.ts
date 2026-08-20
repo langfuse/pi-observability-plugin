@@ -21,6 +21,7 @@ const ROOT_OBSERVATION_NAME = "Conversational Turn";
 const SUBAGENT_ROOT_OBSERVATION_NAME = "Subagent Turn";
 const GENERATION_PREFIX = "LLM Call";
 const TOOL_PREFIX = "Tool:";
+const COMPACTION_OBSERVATION_NAME = "Compaction";
 const BASE_TAGS = ["pi"];
 const MAX_CHARS = Number(process.env.PI_LANGFUSE_MAX_CHARS ?? "20000");
 
@@ -447,6 +448,7 @@ export default function (pi: ExtensionAPI) {
   let sessionHadImages = false;
   let fallbackTurnCounter = 0;
   let lastPromptText = "";
+  let compactionStartedAt: Date | undefined;
   const inheritedParent = readInheritedParent();
   const inheritedParentEnv: Record<string, string | undefined> = {
     [ENV_PARENT_TRACE_ID]: process.env[ENV_PARENT_TRACE_ID],
@@ -806,6 +808,100 @@ export default function (pi: ExtensionAPI) {
       name: open.name,
       content: outText.slice(0, 4000),
     });
+  });
+
+  const emitSummarizationGeneration = (
+    name: string,
+    ctx: ExtensionContext,
+    attributes: {
+      output?: { role: string; content: string };
+      model?: string;
+      usageDetails?: Record<string, number>;
+      costDetails?: Record<string, number>;
+      metadata: Record<string, unknown>;
+    },
+    startedAt?: Date,
+  ): void => {
+    if (state) {
+      const obs = startObservation(name, attributes, {
+        asType: "generation",
+        parentSpanContext: state.root.otelSpan.spanContext(),
+        ...(startedAt ? { startTime: startedAt } : {}),
+      });
+      obs.end();
+      return;
+    }
+    // ensureRuntime is otherwise only called in before_agent_start; an idle
+    // /compact in a fresh process would hit the unset tracer provider.
+    ensureRuntime();
+    const sessionId = ctx.sessionManager.getSessionId();
+    const obs = startObservation(
+      name,
+      {
+        ...attributes,
+        metadata: {
+          ...attributes.metadata,
+          source: "pi",
+          extension: EXTENSION_NAME,
+          extension_version: EXTENSION_VERSION,
+          session_id: sessionId,
+        },
+      },
+      {
+        asType: "generation",
+        ...(startedAt ? { startTime: startedAt } : {}),
+        ...(inheritedParent ? { parentSpanContext: inheritedParent.spanContext } : {}),
+      },
+    );
+    if (!inheritedParent) {
+      obs.otelSpan.setAttribute(
+        LangfuseOtelSpanAttributes.TRACE_NAME,
+        `Pi - ${name} (${shortSessionLabel(sessionId)})`,
+      );
+      obs.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_SESSION_ID, sessionId);
+      obs.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_TAGS, BASE_TAGS);
+      if (config.userId) {
+        obs.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_USER_ID, config.userId);
+      }
+    }
+    obs.end();
+    void flush();
+  }
+
+  pi.on("session_before_compact", () => {
+    compactionStartedAt = new Date();
+  });
+
+  pi.on("session_compact", (event, ctx) => {
+    const startedAt = compactionStartedAt;
+    compactionStartedAt = undefined;
+    const entry = event.compactionEntry as
+      | { summary?: string; tokensBefore?: number; usage?: PiUsage; fromHook?: boolean }
+      | undefined;
+    const usage = entry?.usage;
+    const { text: summaryText, meta: summaryMeta } = truncateText(entry?.summary ?? "");
+    emitSummarizationGeneration(
+      COMPACTION_OBSERVATION_NAME,
+      ctx,
+      {
+        output: summaryText ? { role: "assistant", content: summaryText } : undefined,
+        model: ctx.model?.id,
+        usageDetails: usage ? buildUsageDetails(usage) : undefined,
+        costDetails: usage ? buildCostDetails(usage) : undefined,
+        metadata: {
+          compaction_reason: event.reason,
+          will_retry: event.willRetry,
+          from_extension: event.fromExtension,
+          ...(usage?.cacheWrite1h ? { cache_write_1h_tokens: usage.cacheWrite1h } : {}),
+          ...(entry?.fromHook ? { from_hook: true } : {}),
+          ...(typeof entry?.tokensBefore === "number" ? { tokens_before: entry.tokensBefore } : {}),
+          ...(ctx.model ? { provider: ctx.model.provider } : {}),
+          summary_meta: summaryMeta,
+        },
+      },
+      startedAt,
+    );
+    debug("compaction traced", usage?.input, usage?.output, usage?.cost?.total);
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
