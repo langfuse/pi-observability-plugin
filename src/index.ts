@@ -19,7 +19,7 @@ const EXTENSION_NAME = "@langfuse/pi-observability-plugin";
 const EXTENSION_VERSION = "0.0.1";
 const ROOT_OBSERVATION_NAME = "Conversational Turn";
 const SUBAGENT_ROOT_OBSERVATION_NAME = "Subagent Turn";
-const GENERATION_PREFIX = "LLM Call"; 
+const GENERATION_PREFIX = "LLM Call";
 const TOOL_PREFIX = "Tool:";
 const BASE_TAGS = ["pi"];
 const MAX_CHARS = Number(process.env.PI_LANGFUSE_MAX_CHARS ?? "20000");
@@ -303,19 +303,30 @@ export interface PiUsage {
 }
 
 /**
+ * Whether the reasoning tokens can be split out of `output`.
+ *
+ * pi reports `reasoning` as a subset of `output`. A provider that reports more
+ * reasoning than output would make the split produce a negative bucket, so both
+ * {@link buildUsageDetails} and {@link buildCostDetails} fall back to a single
+ * `output` bucket in that case. They MUST agree, otherwise a usage bucket ends
+ * up without its cost counterpart.
+ */
+function resolveReasoningSplit(usage: PiUsage): { reasoning: number; canSplit: boolean } {
+  const reasoning = usage.reasoning ?? 0;
+  return { reasoning, canSplit: reasoning > 0 && reasoning <= usage.output };
+}
+
+/**
  * Changes the pi usage counts into Langfuse usage details. Langfuse counts each
  * token in one key only, but pi includes the reasoning tokens in `output`.
  */
 export function buildUsageDetails(usage: PiUsage): Record<string, number> | undefined {
   const details: Record<string, number> = {};
   if (usage.input > 0) details.input = usage.input;
-  // Do not split when a provider reports more reasoning than output tokens.
-  // A count that is too large makes the total wrong.
-  const reasoning = usage.reasoning ?? 0;
-  const canSplitReasoning = reasoning > 0 && reasoning <= usage.output;
-  const output = canSplitReasoning ? usage.output - reasoning : usage.output;
+  const { reasoning, canSplit } = resolveReasoningSplit(usage);
+  const output = canSplit ? usage.output - reasoning : usage.output;
   if (output > 0) details.output = output;
-  if (canSplitReasoning) details.output_reasoning_tokens = reasoning;
+  if (canSplit) details.output_reasoning_tokens = reasoning;
   if (usage.cacheRead > 0) details.cache_read_input_tokens = usage.cacheRead;
   if (usage.cacheWrite > 0) details.cache_creation_input_tokens = usage.cacheWrite;
   return Object.keys(details).length ? details : undefined;
@@ -323,14 +334,30 @@ export function buildUsageDetails(usage: PiUsage): Record<string, number> | unde
 
 /**
  * Cost keys must mirror the usage keys ({@link buildUsageDetails}) — Langfuse
- * joins the two by name, and server-side pricing emits the same spellings.
+ * joins the two by name, and server-side pricing emits the same spellings. A
+ * usage bucket without its cost twin makes the bucket's implied per-token rate
+ * wrong in the UI even though the total stays correct.
  */
 export function buildCostDetails(usage: PiUsage): Record<string, number> | undefined {
   const cost = usage.cost;
   if (!cost || !(cost.total > 0)) return undefined;
   const details: Record<string, number> = { total: cost.total };
   if (cost.input > 0) details.input = cost.input;
-  if (cost.output > 0) details.output = cost.output;
+  if (cost.output > 0) {
+    // pi prices every output token of a call at one rate (its tier selection
+    // reads only input-side tokens), so the reasoning share is exactly
+    // proportional. Deriving the non-reasoning bucket by subtraction keeps the
+    // two buckets summing bit-for-bit to the total pi reported.
+    const { reasoning, canSplit } = resolveReasoningSplit(usage);
+    if (canSplit) {
+      const reasoningCost = cost.output * (reasoning / usage.output);
+      const nonReasoningCost = cost.output - reasoningCost;
+      if (nonReasoningCost > 0) details.output = nonReasoningCost;
+      if (reasoningCost > 0) details.output_reasoning_tokens = reasoningCost;
+    } else {
+      details.output = cost.output;
+    }
+  }
   if (cost.cacheRead > 0) details.cache_read_input_tokens = cost.cacheRead;
   if (cost.cacheWrite > 0) details.cache_creation_input_tokens = cost.cacheWrite;
   return details;
