@@ -56,7 +56,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       const root = roots[0]!;
       assert.equal(root.parentSpanId, undefined);
       assert.equal(root.attrs["langfuse.observation.type"], "span");
-      assert.match(String(root.attrs["langfuse.trace.name"]), /^Pi - Turn 1 \(.+\)$/);
+      assert.equal(root.attrs["langfuse.trace.name"], "Pi Turn");
       assert.equal(root.attrs["user.id"], "test-user");
       assert.ok(root.attrs["session.id"], "sessionId must be set");
       assert.deepEqual(root.attrs["langfuse.trace.tags"], ["pi"]);
@@ -138,8 +138,17 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       const [t1, t2] = [...roots].sort((a, b) => (a.startNs < b.startNs ? -1 : 1));
       assert.notEqual(t1!.traceId, t2!.traceId, "each prompt is its own trace");
       assert.equal(t1!.attrs["session.id"], t2!.attrs["session.id"], "same pi session");
-      assert.match(String(t1!.attrs["langfuse.trace.name"]), /Turn 1/);
-      assert.match(String(t2!.attrs["langfuse.trace.name"]), /Turn 2/, "turn number must survive pi -c restarts");
+      assert.equal(Number(t1!.attrs["langfuse.observation.metadata.turn_number"]), 1);
+      assert.equal(
+        Number(t2!.attrs["langfuse.observation.metadata.turn_number"]),
+        2,
+        "turn number must survive pi -c restarts",
+      );
+      assert.equal(
+        t1!.attrs["langfuse.trace.name"],
+        t2!.attrs["langfuse.trace.name"],
+        "trace name is constant so Langfuse name-based grouping works",
+      );
     } finally {
       capture.close();
     }
