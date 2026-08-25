@@ -372,6 +372,8 @@ export function buildCostDetails(usage: PiUsage): Record<string, number> | undef
 // Runtime (isolated OTEL provider — never touches the global provider)
 // ---------------------------------------------------------------------------
 
+type TraceAttributes = Record<string, string | string[]>;
+
 interface Runtime {
   processor: LangfuseSpanProcessor;
   provider: NodeTracerProvider;
@@ -383,7 +385,10 @@ function isLangfuseSpan(span: { attributes: Record<string, unknown> }): boolean 
   return typeof observationType === "string";
 }
 
-function createRuntime(config: LangfuseConfig): Runtime {
+function createRuntime(
+  config: LangfuseConfig,
+  resolveTraceAttributes: () => TraceAttributes,
+): Runtime {
   const redactSecrets = createSecretRedactor(config.publicKey, config.secretKey);
   const processor = new LangfuseSpanProcessor({
     publicKey: config.publicKey,
@@ -394,6 +399,11 @@ function createRuntime(config: LangfuseConfig): Runtime {
     mask: ({ data }) => redactSecrets(data),
     shouldExportSpan: ({ otelSpan }) => isLangfuseSpan(otelSpan),
   });
+  const baseOnStart = processor.onStart.bind(processor);
+  processor.onStart = (span, parentContext) => {
+    baseOnStart(span, parentContext);
+    span.setAttributes(resolveTraceAttributes());
+  };
   const provider = new NodeTracerProvider({
     spanProcessors: [processor],
     sampler: new AlwaysOnSampler(),
@@ -446,6 +456,7 @@ export default function (pi: ExtensionAPI) {
 
   let runtime: Runtime | undefined;
   let state: PromptState | undefined;
+  let traceAttributes: TraceAttributes = {};
   let gitBranch: string | undefined;
   let sessionHadImages = false;
   let fallbackTurnCounter = 0;
@@ -460,7 +471,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const ensureRuntime = (): Runtime => {
-    if (!runtime || runtime.shutdown) runtime = createRuntime(config);
+    if (!runtime || runtime.shutdown) runtime = createRuntime(config, () => traceAttributes);
     return runtime;
   };
 
@@ -601,6 +612,16 @@ export default function (pi: ExtensionAPI) {
     const userText = [promptText, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
     lastPromptText = userText;
     const isSubagent = Boolean(inheritedParent);
+    traceAttributes = {
+      ...(isSubagent
+        ? {}
+        : { [LangfuseOtelSpanAttributes.TRACE_NAME]: `Pi - Turn ${turnNumber} (${shortSessionLabel(sessionId)})` }),
+      [LangfuseOtelSpanAttributes.TRACE_SESSION_ID]: isSubagent
+        ? (inheritedParent!.sessionId ?? sessionId)
+        : sessionId,
+      [LangfuseOtelSpanAttributes.TRACE_TAGS]: BASE_TAGS,
+      ...(config.userId ? { [LangfuseOtelSpanAttributes.TRACE_USER_ID]: config.userId } : {}),
+    };
 
     const root = startObservation(
       isSubagent ? SUBAGENT_ROOT_OBSERVATION_NAME : ROOT_OBSERVATION_NAME,
@@ -623,19 +644,6 @@ export default function (pi: ExtensionAPI) {
       },
       { asType: "span", ...(inheritedParent ? { parentSpanContext: inheritedParent.spanContext } : {}) },
     );
-    // Trace fields go on the root span, because an extension must not install
-    // the global OTel context manager. Only the top process sets them.
-    if (!isSubagent) {
-      root.otelSpan.setAttribute(
-        LangfuseOtelSpanAttributes.TRACE_NAME,
-        `Pi - Turn ${turnNumber} (${shortSessionLabel(sessionId)})`,
-      );
-      root.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_SESSION_ID, sessionId);
-      root.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_TAGS, BASE_TAGS);
-      if (config.userId) {
-        root.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_USER_ID, config.userId);
-      }
-    }
 
     state = {
       root,
@@ -865,6 +873,14 @@ export default function (pi: ExtensionAPI) {
     // /compact in a fresh process would hit the unset tracer provider.
     ensureRuntime();
     const sessionId = ctx.sessionManager.getSessionId();
+    traceAttributes = {
+      ...(inheritedParent
+        ? {}
+        : { [LangfuseOtelSpanAttributes.TRACE_NAME]: `Pi - ${name} (${shortSessionLabel(sessionId)})` }),
+      [LangfuseOtelSpanAttributes.TRACE_SESSION_ID]: inheritedParent?.sessionId ?? sessionId,
+      [LangfuseOtelSpanAttributes.TRACE_TAGS]: BASE_TAGS,
+      ...(config.userId ? { [LangfuseOtelSpanAttributes.TRACE_USER_ID]: config.userId } : {}),
+    };
     const obs = startObservation(
       name,
       {
@@ -883,17 +899,6 @@ export default function (pi: ExtensionAPI) {
         ...(inheritedParent ? { parentSpanContext: inheritedParent.spanContext } : {}),
       },
     );
-    if (!inheritedParent) {
-      obs.otelSpan.setAttribute(
-        LangfuseOtelSpanAttributes.TRACE_NAME,
-        `Pi - ${name} (${shortSessionLabel(sessionId)})`,
-      );
-      obs.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_SESSION_ID, sessionId);
-      obs.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_TAGS, BASE_TAGS);
-      if (config.userId) {
-        obs.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_USER_ID, config.userId);
-      }
-    }
     obs.end();
     void flush();
   }
