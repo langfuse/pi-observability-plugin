@@ -19,6 +19,7 @@ const EXTENSION_NAME = "@langfuse/pi-observability-plugin";
 const EXTENSION_VERSION = "0.0.1";
 const ROOT_OBSERVATION_NAME = "Conversational Turn";
 const SUBAGENT_ROOT_OBSERVATION_NAME = "Subagent Turn";
+const TRACE_NAME = "Pi Turn";
 const GENERATION_PREFIX = "LLM Call";
 const TOOL_PREFIX = "Tool:";
 const COMPACTION_OBSERVATION_NAME = "Compaction";
@@ -287,13 +288,6 @@ export function toMultimodalContent(
     ...(text ? [{ type: "text" as const, text }] : []),
     ...urls.map((url) => ({ type: "image_url" as const, image_url: { url } })),
   ];
-}
-
-export function shortSessionLabel(sessionId: string): string {
-  if (!sessionId) return "unknown";
-  const parts = sessionId.split("-");
-  if (parts.length === 5 && parts[0]?.length === 8) return parts[0];
-  return sessionId.slice(0, 12).replace(/-+$/, "") || "unknown";
 }
 
 export interface PiUsage {
@@ -626,10 +620,7 @@ export default function (pi: ExtensionAPI) {
     // Trace fields go on the root span, because an extension must not install
     // the global OTel context manager. Only the top process sets them.
     if (!isSubagent) {
-      root.otelSpan.setAttribute(
-        LangfuseOtelSpanAttributes.TRACE_NAME,
-        `Pi - Turn ${turnNumber} (${shortSessionLabel(sessionId)})`,
-      );
+      root.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_NAME, TRACE_NAME);
       root.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_SESSION_ID, sessionId);
       root.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_TAGS, BASE_TAGS);
       if (config.userId) {
@@ -884,10 +875,7 @@ export default function (pi: ExtensionAPI) {
       },
     );
     if (!inheritedParent) {
-      obs.otelSpan.setAttribute(
-        LangfuseOtelSpanAttributes.TRACE_NAME,
-        `Pi - ${name} (${shortSessionLabel(sessionId)})`,
-      );
+      obs.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_NAME, `Pi ${name}`);
       obs.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_SESSION_ID, sessionId);
       obs.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_TAGS, BASE_TAGS);
       if (config.userId) {

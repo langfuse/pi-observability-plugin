@@ -10,10 +10,10 @@ The extension makes one Langfuse trace for each user prompt. All traces of one p
 session share a session id.
 
 ```
-[trace]  "Pi - Turn 3 (a1b2c3d4)"         ← the turn number survives a pi restart
-└─ span  "Conversational Turn"
-   ├─ generation "LLM Call 1"              ← tokens with the cache split, cost, TTFT
-   ├─ tool       "Tool: bash"              ← input, output, ERROR level on a failure
+[trace]  "Pi Turn"             ← constant, so traces group by name
+└─ span  "Conversational Turn" ← turn_number metadata survives a pi restart
+   ├─ generation "LLM Call 1"  ← tokens with the cache split, cost, TTFT
+   ├─ tool       "Tool: bash"  ← input, output, ERROR level on a failure
    ├─ generation "LLM Call 2"
    └─ ...
 ```
