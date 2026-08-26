@@ -4,88 +4,125 @@ This extension sends [pi coding agent](https://pi.dev) sessions to
 [Langfuse](https://langfuse.com). It records the user prompts, the agent turns,
 the model generations with their tokens and cost, and the tool calls.
 
-## Trace model
+The full setup guide is the
+[Pi Agent integration page](https://langfuse.com/integrations/developer-tools/pi-agent),
+which also covers troubleshooting.
 
-The extension makes one Langfuse trace for each user prompt. All traces of one pi
-session share a session id.
+> **Experimental release.** Future versions can bring breaking changes to the
+> setup and to the trace structure.
 
-```
-[trace]  "Pi Turn"             ← constant, so traces group by name
-└─ span  "Conversational Turn" ← turn_number metadata survives a pi restart
-   ├─ generation "LLM Call 1"  ← tokens with the cache split, cost, TTFT
-   ├─ tool       "Tool: bash"  ← input, output, ERROR level on a failure
-   ├─ generation "LLM Call 2"
-   └─ ...
-```
+## What can this integration trace?
 
-You can use this extension together with the other extensions from the pi
-package gallery. It listens to the pi core events, so it also records the work of
-a tool or a subagent that another extension adds.
+The plugin listens to Pi's core lifecycle events and sends every user prompt to
+Langfuse as its own trace:
 
-## Try it locally
+- **Agent turns**: one trace per user prompt, with all turns of a Pi session
+  grouped under one session ID. Turn numbering survives a Pi restart.
+- **Model generations**: every model request with inputs, outputs, cost, time to
+  first token, and token usage including cache-read and reasoning splits.
+- **Tool calls**: each tool Pi invokes, with input, output, and an `ERROR` level
+  when the call fails.
+- **Images**: images you add to a prompt are uploaded as Langfuse media and
+  render inside the trace.
+- **Subagents**: Pi processes spawned by other extensions nest under the turn
+  that started them.
+
+## Prerequisites
+
+Pi needs Node.js 22.0.0 or newer, and pi's package installer shells out to
+`npm`, so npm has to be on your `PATH`.
+
+## Install
 
 ```bash
-# 1. install the dependencies (one time)
-cd pi-observability-plugin && pnpm install
+pi install npm:@langfuse/pi-observability-plugin
+```
 
-# 2. register the extension with pi (one time, from any directory)
-pi install /absolute/path/to/pi-observability-plugin
+To try it for a single run, without installing:
 
-# 3a. give the keys in a file (recommended): ~/.pi/agent/langfuse.json, chmod 600
+```bash
+pi -e npm:@langfuse/pi-observability-plugin
+```
+
+## Add your Langfuse credentials
+
+Create a credentials file at `~/.pi/agent/langfuse.json`:
+
+```json
 {
   "publicKey": "pk-lf-...",
   "secretKey": "sk-lf-...",
   "baseUrl": "https://cloud.langfuse.com",
-  "userId": "you",              // optional
-  "environment": "dev",         // optional
-  "release": "..."              // optional
+  "userId": "your-user-id",
+  "environment": "development"
 }
-# then start pi in any project: cd <any-project> && pi
-
-# 3b. or give the keys in the shell. These values replace the file.
-export LANGFUSE_PUBLIC_KEY=pk-lf-...
-export LANGFUSE_SECRET_KEY=sk-lf-...
-export LANGFUSE_BASE_URL=https://cloud.langfuse.com   # or LANGFUSE_HOST
-pi "Summarize this repository"
 ```
 
-The extension reads the configuration in this order: the kill switch
-`LANGFUSE_TRACING_ENABLED=false` first, then the environment variables, then
-`~/.pi/agent/langfuse.json`, then the defaults. The file holds literal values
-only. It cannot hold an environment variable and it cannot run a command.
+Only `publicKey` and `secretKey` are required. If `baseUrl` is omitted, the
+plugin uses `https://cloud.langfuse.com` (EU region). `userId`, `environment`
+and `release` are optional labels that let you segment traces by teammate, stage
+or version. Keep the file private, because it holds a secret key.
 
-## Enable and disable the tracing
+Alternatively, set your credentials with environment variables:
 
-| Scope | How |
-|---|---|
-| One run | `LANGFUSE_TRACING_ENABLED=false pi` |
-| The current shell | `export LANGFUSE_TRACING_ENABLED=false` (to undo: `unset …`) |
-| Global or project scope | `pi config`, then switch the extension off |
-| Remove the extension | `pi remove /absolute/path/to/pi-observability-plugin` |
+```bash
+export LANGFUSE_PUBLIC_KEY="pk-lf-..."
+export LANGFUSE_SECRET_KEY="sk-lf-..."
+export LANGFUSE_BASE_URL="https://cloud.langfuse.com"
+export LANGFUSE_TRACING_ENVIRONMENT="development"
+export LANGFUSE_USER_ID="your-user-id"
+```
 
-The kill switch has priority over the environment keys and over the file. When
-the tracing is off, the status line shows `langfuse: off (no keys)` and the
-extension sends nothing.
+Environment variables take precedence over the config file, so you can override
+a single value without editing the file.
 
-To remove the keys, delete `~/.pi/agent/langfuse.json`.
+## Environment variables
 
-For a script, close the standard input in print mode: `pi -p "..." < /dev/null`.
-pi waits for the end of the file on a piped standard input.
+| Variable                       | Description                                                                                                                                       | Required            |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| `LANGFUSE_PUBLIC_KEY`          | Your Langfuse public key (`pk-lf-...`)                                                                                                            | Yes                 |
+| `LANGFUSE_SECRET_KEY`          | Your Langfuse secret key (`sk-lf-...`)                                                                                                            | Yes                 |
+| `LANGFUSE_BASE_URL`            | Langfuse host. EU: `https://cloud.langfuse.com`, US: `https://us.cloud.langfuse.com`, Japan: `https://jp.cloud.langfuse.com`, HIPAA: `https://hipaa.cloud.langfuse.com` | No (defaults to EU) |
+| `LANGFUSE_TRACING_ENVIRONMENT` | Environment label for the traces (e.g. `production`)                                                                                              | No                  |
+| `LANGFUSE_USER_ID`             | User ID attached to all traces                                                                                                                    | No                  |
 
-`PI_LANGFUSE_DEBUG=true` writes the steps of the extension to the standard error.
+## Enable and disable tracing
 
-## Subagent nesting
+| Scope                   | How                                                         |
+| ----------------------- | ----------------------------------------------------------- |
+| One run                 | `LANGFUSE_TRACING_ENABLED=false pi`                         |
+| The current shell       | `export LANGFUSE_TRACING_ENABLED=false` (undo with `unset`) |
+| Global or project scope | `pi config`, then switch the extension off                  |
+| Remove the plugin       | `pi remove npm:@langfuse/pi-observability-plugin`           |
 
-A pi subagent is a second pi process. The subagent example extension starts one
-for each task, and so do the gallery orchestration packages. A child process gets
-the environment of its parent.
+The kill switch has priority over environment keys and the config file. When
+tracing is off, the status line shows `langfuse: off (no keys)` and nothing is
+sent. This message reads the same whether the kill switch is set or the keys are
+genuinely missing. To remove stored keys, delete `~/.pi/agent/langfuse.json`.
 
-While a turn is active, the extension puts the ids of that turn in the
-environment: `LANGFUSE_PI_PARENT_TRACE_ID`, `LANGFUSE_PI_PARENT_SPAN_ID`,
-`LANGFUSE_PI_PARENT_SESSION_ID` and `LANGFUSE_PI_PARENT_DEPTH`. A pi process that
-finds these ids puts its trace below the turn that started it. Without them, the
-child writes a separate trace.
+`pi remove` needs the same source you installed from. For a local checkout, see
+[Development](#development).
 
-You can also set these variables yourself to attach a run to a trace from
-another tool. The ids must belong to the same Langfuse project that the run
-exports to. The built-in flow needs no configuration.
+## Development
+
+```bash
+pnpm install
+pnpm run typecheck
+pnpm test
+```
+
+The package ships raw TypeScript and pi reads `src/index.ts` directly, so there
+is no build step. Therefore `files` in `package.json` holds only `src`,
+`README.md` and `LICENSE`.
+
+To run a local checkout against pi:
+
+```bash
+pi install /absolute/path/to/pi-observability-plugin
+```
+
+Remove it again with `pi remove /absolute/path/to/pi-observability-plugin`.
+
+## License
+
+[MIT](./LICENSE)
