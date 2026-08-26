@@ -8,8 +8,8 @@ The full setup guide is the
 [Pi Agent integration page](https://langfuse.com/integrations/developer-tools/pi-agent),
 which also covers troubleshooting.
 
-> **Experimental release.** Future versions can bring breaking changes to the
-> setup and to the trace structure.
+> [!WARNING]
+> This is an experimental release, so future versions can bring breaking changes.
 
 ## What can this integration trace?
 
