@@ -119,6 +119,21 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       for (const span of tree) {
         assert.ok(span.endNs > span.startNs, `${span.name} must have a real duration`);
       }
+
+      // Trace fields on EVERY span, not only the root: Langfuse reads them per
+      // span, and session-level aggregation groups by the session id on each
+      // row, so the generations that carry the cost must carry it too.
+      assert.equal(tree.length, 6, "root + 3 generations + 2 tools");
+      for (const span of tree) {
+        assert.equal(span.attrs["session.id"], root.attrs["session.id"], `${span.name} must carry the session id`);
+        assert.equal(span.attrs["user.id"], "test-user", `${span.name} must carry the user id`);
+        assert.deepEqual(span.attrs["langfuse.trace.tags"], ["pi"], `${span.name} must carry the tags`);
+        assert.equal(
+          span.attrs["langfuse.trace.name"],
+          root.attrs["langfuse.trace.name"],
+          `${span.name} must carry the trace name`,
+        );
+      }
     } finally {
       capture.close();
     }
@@ -224,9 +239,14 @@ describe("integration: pi -> extension -> Langfuse export", () => {
         undefined,
         "subagent must not overwrite the trace name it is nested into",
       );
-      assert.equal(subagentRoot!.attrs["session.id"], undefined, "subagent must not set the session");
-      assert.equal(subagentRoot!.attrs["user.id"], undefined, "subagent must not set the user");
-      assert.equal(subagentRoot!.attrs["langfuse.trace.tags"], undefined, "subagent must not set tags");
+
+      assert.equal(
+        subagentRoot!.attrs["session.id"],
+        parentRoot!.attrs["session.id"],
+        "subagent spans must join the parent's session",
+      );
+      assert.equal(subagentRoot!.attrs["user.id"], "test-user", "subagent spans must carry the user id");
+      assert.deepEqual(subagentRoot!.attrs["langfuse.trace.tags"], ["pi"], "subagent spans must carry the tags");
       const meta = (k: string) => subagentRoot!.attrs[`langfuse.observation.metadata.${k}`];
       assert.equal(String(meta("pi_subagent")), "true");
       assert.equal(Number(meta("subagent_depth")), 1);
@@ -234,6 +254,14 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       // The model calls of the subagent go in the same trace. Their tokens add
       // to the parent totals.
       const subagentChildren = spans.filter((s) => s.parentSpanId === subagentRoot!.spanId);
+      for (const child of subagentChildren) {
+        assert.equal(
+          child.attrs["session.id"],
+          parentRoot!.attrs["session.id"],
+          `${child.name} (subagent child) must carry the parent's session id`,
+        );
+        assert.equal(child.attrs["langfuse.trace.name"], undefined, `${child.name} must not carry a trace name`);
+      }
       assert.ok(
         subagentChildren.some((s) => s.attrs["langfuse.observation.type"] === "generation"),
         "the subagent's generations must be nested under it",
