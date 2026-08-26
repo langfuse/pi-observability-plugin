@@ -5,6 +5,7 @@
   "license": "MIT",
   "author": "Langfuse",
   "type": "module",
+  "packageManager": "pnpm@11.22.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/langfuse/pi-observability-plugin.git"
