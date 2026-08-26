@@ -19,6 +19,7 @@ const EXTENSION_NAME = "@langfuse/pi-observability-plugin";
 const EXTENSION_VERSION = "0.0.1";
 const ROOT_OBSERVATION_NAME = "Conversational Turn";
 const SUBAGENT_ROOT_OBSERVATION_NAME = "Subagent Turn";
+const TRACE_NAME = "Pi Turn";
 const GENERATION_PREFIX = "LLM Call";
 const TOOL_PREFIX = "Tool:";
 const COMPACTION_OBSERVATION_NAME = "Compaction";
@@ -289,13 +290,6 @@ export function toMultimodalContent(
   ];
 }
 
-export function shortSessionLabel(sessionId: string): string {
-  if (!sessionId) return "unknown";
-  const parts = sessionId.split("-");
-  if (parts.length === 5 && parts[0]?.length === 8) return parts[0];
-  return sessionId.slice(0, 12).replace(/-+$/, "") || "unknown";
-}
-
 export interface PiUsage {
   input: number;
   output: number;
@@ -399,6 +393,9 @@ function createRuntime(
     mask: ({ data }) => redactSecrets(data),
     shouldExportSpan: ({ otelSpan }) => isLangfuseSpan(otelSpan),
   });
+  // Trace fields are stamped here rather than on the root span: Langfuse reads
+  // them per span, and an extension must not install the global OTel context
+  // manager that propagateAttributes() would need.
   const baseOnStart = processor.onStart.bind(processor);
   processor.onStart = (span, parentContext) => {
     baseOnStart(span, parentContext);
@@ -613,9 +610,7 @@ export default function (pi: ExtensionAPI) {
     lastPromptText = userText;
     const isSubagent = Boolean(inheritedParent);
     traceAttributes = {
-      ...(isSubagent
-        ? {}
-        : { [LangfuseOtelSpanAttributes.TRACE_NAME]: `Pi - Turn ${turnNumber} (${shortSessionLabel(sessionId)})` }),
+      ...(isSubagent ? {} : { [LangfuseOtelSpanAttributes.TRACE_NAME]: TRACE_NAME }),
       [LangfuseOtelSpanAttributes.TRACE_SESSION_ID]: isSubagent
         ? (inheritedParent!.sessionId ?? sessionId)
         : sessionId,
@@ -874,9 +869,7 @@ export default function (pi: ExtensionAPI) {
     ensureRuntime();
     const sessionId = ctx.sessionManager.getSessionId();
     traceAttributes = {
-      ...(inheritedParent
-        ? {}
-        : { [LangfuseOtelSpanAttributes.TRACE_NAME]: `Pi - ${name} (${shortSessionLabel(sessionId)})` }),
+      ...(inheritedParent ? {} : { [LangfuseOtelSpanAttributes.TRACE_NAME]: `Pi ${name}` }),
       [LangfuseOtelSpanAttributes.TRACE_SESSION_ID]: inheritedParent?.sessionId ?? sessionId,
       [LangfuseOtelSpanAttributes.TRACE_TAGS]: BASE_TAGS,
       ...(config.userId ? { [LangfuseOtelSpanAttributes.TRACE_USER_ID]: config.userId } : {}),

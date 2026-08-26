@@ -8,7 +8,6 @@ import {
   extractImages,
   createSecretRedactor,
   renderContentWithImageMarkers,
-  shortSessionLabel,
   extractToolCalls,
   toMultimodalContent,
   truncateText,
@@ -117,20 +116,6 @@ describe("extractText / extractToolCalls", () => {
 
   it("extracts tool calls as {id, name} only (no arguments)", () => {
     assert.deepEqual(extractToolCalls(content), [{ id: "call_1", name: "bash" }]);
-  });
-});
-
-describe("shortSessionLabel", () => {
-  it("uses the first block of a UUID", () => {
-    assert.equal(shortSessionLabel("019fdc53-ba3c-73be-855b-b134fe182bbf"), "019fdc53");
-  });
-
-  it("falls back to the first 12 chars for other formats", () => {
-    assert.equal(shortSessionLabel("2026-08-07T13-05-02"), "2026-08-07T1");
-  });
-
-  it("handles empty ids", () => {
-    assert.equal(shortSessionLabel(""), "unknown");
   });
 });
 
