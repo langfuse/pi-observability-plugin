@@ -26,7 +26,7 @@ a tool or a subagent that another extension adds.
 
 ```bash
 # 1. install the dependencies (one time)
-cd pi-observability-plugin && npm install
+cd pi-observability-plugin && pnpm install
 
 # 2. register the extension with pi (one time, from any directory)
 pi install /absolute/path/to/pi-observability-plugin

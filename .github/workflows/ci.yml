@@ -29,15 +29,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
-          cache: npm
+          cache: pnpm
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
       - name: Typecheck
-        run: npm run typecheck
+        run: pnpm run typecheck
 
   test:
     # The suite starts the real pi command-line interface, so a test against
@@ -60,20 +62,28 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node }}
-          cache: npm
+          cache: pnpm
       - name: Install dependencies
-        run: npm ci
-      - name: Install pi ${{ matrix.pi-version }}
-        if: matrix.pi-version != ''
+        run: pnpm install --frozen-lockfile
+      - name: Install pi ${{ matrix.pi-version || 'from devDependency' }}
         # The version goes to the shell as an environment variable, so no
         # workflow expression becomes executable code.
         env:
           PI_VERSION: ${{ matrix.pi-version }}
         run: |
+          # Every matrix job installs pi with npm. pi has an npm-shrinkwrap.json file
+          # that keeps its dependency versions constant. npm uses this file, but pnpm
+          # does not. This step installs only pi, and it uses a temporary directory.
+          if [ -z "$PI_VERSION" ]; then
+            PI_VERSION="$(node -p "require('$GITHUB_WORKSPACE/node_modules/@earendil-works/pi-coding-agent/package.json').version")"
+            echo "The devDependency resolves to pi $PI_VERSION."
+          fi
           mkdir -p "$RUNNER_TEMP/pi-matrix"
           cd "$RUNNER_TEMP/pi-matrix"
           npm init -y >/dev/null
@@ -81,7 +91,7 @@ jobs:
           echo "PI_BIN=$RUNNER_TEMP/pi-matrix/node_modules/.bin/pi" >> "$GITHUB_ENV"
           ./node_modules/.bin/pi --version
       - name: Test
-        run: npm test
+        run: pnpm test
         env:
           PI_SKIP_VERSION_CHECK: "1"
           PI_TELEMETRY: "0"

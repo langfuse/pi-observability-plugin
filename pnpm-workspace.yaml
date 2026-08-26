@@ -1,0 +1,8 @@
+packages:
+  - "."
+
+# Both come from the @earendil-works/pi-coding-agent devDependency that the
+# integration tests run against.
+allowBuilds:
+  "@google/genai": true
+  protobufjs: true

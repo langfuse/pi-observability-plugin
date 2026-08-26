@@ -1,7 +1,7 @@
 rules:
   adhoc-packages:
     ignore:
-      # The CI test matrix installs pi versions 0.83.0, 0.84.1 and latest into
-      # $RUNNER_TEMP. These versions are different from the devDependency. The
-      # installation is outside the lock file because the test needs it.
+      # The CI matrix jobs install pi with npm into $RUNNER_TEMP. The lock file
+      # does not control this installation, because the tests run the real pi
+      # program. npm uses pi's npm-shrinkwrap.json file, but pnpm does not.
       - ci.yml
