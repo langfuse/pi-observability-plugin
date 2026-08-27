@@ -39,9 +39,7 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-          cache: pnpm
-      - name: Setup npm
-        run: npm install --global npm@11.15.0
+          package-manager-cache: false
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Typecheck
@@ -49,9 +47,9 @@ jobs:
       - name: Stage npm package
         run: |
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
-            npm stage publish --provenance --access public --tag next
+            pnpm exec npm stage publish --provenance --access public --tag next
           else
-            npm stage publish --provenance --access public
+            pnpm exec npm stage publish --provenance --access public
           fi
       - name: Create draft GitHub release
         run: gh release create "$GITHUB_REF_NAME" --draft --generate-notes --verify-tag
