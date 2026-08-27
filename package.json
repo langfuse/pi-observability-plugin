@@ -1,6 +1,6 @@
 {
   "name": "@langfuse/pi-observability-plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Langfuse observability extension for the pi coding agent — traces prompts, agent turns, model generations, and tool calls to Langfuse.",
   "license": "MIT",
   "author": "Langfuse",
@@ -42,6 +42,7 @@
     "@langfuse/otel": "^5.10.0",
     "@langfuse/tracing": "^5.10.0",
     "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.221.0",
     "@opentelemetry/sdk-trace-node": "^2.10.0"
   },
   "peerDependencies": {

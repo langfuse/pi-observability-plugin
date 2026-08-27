@@ -95,3 +95,83 @@ jobs:
         env:
           PI_SKIP_VERSION_CHECK: "1"
           PI_TELEMETRY: "0"
+
+  package:
+    # pi installs extensions with `npm install --legacy-peer-deps`, and that
+    # flag skips peer dependencies. Every other job installs with pnpm, which
+    # does install them, so no other job can see a dependency that the
+    # published package fails to carry.
+    name: Install the packed tarball the way pi does
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Pack the tarball
+        run: |
+          tarball="$(npm pack --pack-destination "$RUNNER_TEMP" --json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8'))[0].filename")"
+          echo "TARBALL=$RUNNER_TEMP/$tarball" >> "$GITHUB_ENV"
+      - name: Install the tarball with pi's flags
+        run: |
+          mkdir -p "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          npm init -y > /dev/null
+          npm install --legacy-peer-deps "$TARBALL"
+      - name: Load the tracing entry point
+        working-directory: ${{ runner.temp }}/consumer
+        run: node --input-type=module -e "await import('@langfuse/otel'); console.log('The tracing entry point loaded.')"
+      - name: Check that every required peer dependency is present
+        working-directory: ${{ runner.temp }}/consumer
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const allowed = new Set(["@earendil-works/pi-coding-agent"]);
+            const root = path.join(process.cwd(), "node_modules");
+            const installed = new Map();
+            const scan = (dir, scope) => {
+              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                if (!entry.isDirectory()) continue;
+                if (entry.name.startsWith("@")) {
+                  scan(path.join(dir, entry.name), entry.name);
+                  continue;
+                }
+                const name = scope ? scope + "/" + entry.name : entry.name;
+                try {
+                  const manifest = path.join(dir, entry.name, "package.json");
+                  installed.set(name, JSON.parse(fs.readFileSync(manifest, "utf8")));
+                } catch {}
+              }
+            };
+            scan(root, null);
+            const missing = [];
+            for (const [name, manifest] of installed) {
+              const meta = manifest.peerDependenciesMeta || {};
+              for (const [peer, range] of Object.entries(manifest.peerDependencies || {})) {
+                if (installed.has(peer)) continue;
+                if (allowed.has(peer)) continue;
+                if (meta[peer] && meta[peer].optional) continue;
+                missing.push(peer + " " + range + " required by " + name);
+              }
+            }
+            if (missing.length > 0) {
+              console.error("The published package does not carry these peer dependencies:");
+              for (const line of missing) console.error("  " + line);
+              console.error("Add each one to dependencies in package.json.");
+              process.exit(1);
+            }
+            console.log("All " + installed.size + " installed packages have their peer dependencies.");
+          '
