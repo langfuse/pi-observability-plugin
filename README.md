@@ -123,6 +123,38 @@ pi install /absolute/path/to/pi-observability-plugin
 
 Remove it again with `pi remove /absolute/path/to/pi-observability-plugin`.
 
+## Release
+
+1. Update the version in `package.json` and `EXTENSION_VERSION` in
+   `src/index.ts`, then merge the version bump into `main`.
+2. Tag that commit with the matching `v`-prefixed version and push the tag:
+
+   ```bash
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+
+   The tag must exactly match the version in `package.json` or the release
+   workflow will fail.
+3. The [release workflow](./.github/workflows/release.yml) installs
+   dependencies, typechecks the package, stages it on npm with provenance,
+   and creates a draft GitHub release with generated release notes.
+   Prerelease versions are staged with the `next` npm tag; stable versions
+   use `latest`.
+4. Review the staged package and approve it to publish, or reject it if
+   anything is wrong. This can be done through npm's staged packages UI or
+   with the npm CLI:
+
+   ```bash
+   npm stage list @langfuse/pi-observability-plugin
+   npm stage view <stage-id>
+   npm stage approve <stage-id>
+   # Or: npm stage reject <stage-id>
+   ```
+
+   Approval and rejection require npm two-factor authentication.
+5. Publish the draft GitHub release after the staged npm package is approved.
+
 ## License
 
 [MIT](./LICENSE)
