@@ -16,7 +16,7 @@ import { type SpanContext, TraceFlags } from "@opentelemetry/api";
 import { AlwaysOnSampler, NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 
 const EXTENSION_NAME = "@langfuse/pi-observability-plugin";
-const EXTENSION_VERSION = "0.1.1";
+const EXTENSION_VERSION = "0.1.2";
 const ROOT_OBSERVATION_NAME = "Conversational Turn";
 const SUBAGENT_ROOT_OBSERVATION_NAME = "Subagent Turn";
 const TRACE_NAME = "Pi Turn";
