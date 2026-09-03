@@ -216,6 +216,47 @@ export function extractToolCalls(content: unknown): Array<{ id: string; name: st
     .map((p) => ({ id: p.id, name: p.name }));
 }
 
+/** The ChatML tool definition the Langfuse UI builds its Tools section from. */
+export interface ToolDefinitionInput {
+  name: string;
+  description?: string;
+  parameters?: unknown;
+}
+
+/**
+ * Definitions of the tools the model is offered, in the order pi sends them.
+ * `getAllTools` covers built-in, extension and MCP tools; `getActiveTools`
+ * names the subset that is actually in the request.
+ */
+export function activeToolDefinitions(
+  pi: Pick<ExtensionAPI, "getAllTools" | "getActiveTools">,
+): ToolDefinitionInput[] {
+  try {
+    // Optional calls: older pi versions have neither accessor.
+    const all = pi.getAllTools?.() ?? [];
+    const active = new Set(pi.getActiveTools?.() ?? []);
+    return all
+      .filter((tool) => active.has(tool.name))
+      .map(({ name, description, parameters }) => ({ name, description, parameters }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Attach tool definitions to the first message of a generation input. The
+ * Langfuse UI reads `message.tools` and dedups by name, so one copy on the
+ * first message is enough; repeating them would only bloat the export.
+ */
+export function attachToolDefinitions(input: unknown, tools: ToolDefinitionInput[]): unknown {
+  if (!tools.length || !input || typeof input !== "object") return input;
+  if (Array.isArray(input)) {
+    const [first, ...rest] = input;
+    return first && typeof first === "object" ? [{ ...first, tools }, ...rest] : input;
+  }
+  return { ...input, tools };
+}
+
 export interface PiImagePart {
   type: "image";
   data: string;
@@ -674,7 +715,7 @@ export default function (pi: ExtensionAPI) {
     const obs = state.root.startObservation(
       GENERATION_PREFIX,
       {
-        input: generationInput,
+        input: attachToolDefinitions(generationInput, activeToolDefinitions(pi)),
         model: ctx.model?.id,
         metadata: {
           assistant_index: index - 1,
