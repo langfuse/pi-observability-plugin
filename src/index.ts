@@ -290,6 +290,26 @@ export function toMultimodalContent(
   ];
 }
 
+/**
+ * Model parameters for the generation's header chips, from what pi resolves
+ * for every request: the model's configured `maxTokens` goes out as the max
+ * output tokens (clamped to the remaining context), and for reasoning models
+ * the thinking level, which each provider maps to its own effort or budget
+ * field. Sampling parameters such as temperature are only sent when a caller
+ * sets them explicitly, which the coding agent does not.
+ */
+export function extractModelParameters(
+  model: { reasoning?: boolean; maxTokens?: number } | undefined,
+  thinkingLevel?: string,
+): Record<string, string | number> | undefined {
+  if (!model) return undefined;
+  const out: Record<string, string | number> = {};
+  if (typeof model.maxTokens === "number" && model.maxTokens > 0) out.max_tokens = model.maxTokens;
+  // `off` means thinking is disabled — no chip.
+  if (model.reasoning && thinkingLevel && thinkingLevel !== "off") out.thinking_level = thinkingLevel;
+  return Object.keys(out).length ? out : undefined;
+}
+
 export interface PiUsage {
   input: number;
   output: number;
@@ -676,6 +696,7 @@ export default function (pi: ExtensionAPI) {
       {
         input: generationInput,
         model: ctx.model?.id,
+        modelParameters: extractModelParameters(ctx.model, ctx.thinkingLevel),
         metadata: {
           assistant_index: index - 1,
           ...(ctx.model ? { provider: ctx.model.provider } : {}),
