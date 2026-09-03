@@ -432,6 +432,7 @@ interface PromptState {
   sawError: boolean;
   userText: string;
   turnImages: PiImagePart[];
+  systemPrompt?: string;
 }
 
 const DEBUG = process.env.PI_LANGFUSE_DEBUG === "true";
@@ -654,6 +655,34 @@ export default function (pi: ExtensionAPI) {
     debug("root created, turn", turnNumber);
   });
 
+  pi.on("agent_start", (_event, ctx) => {
+    if (!state) return;
+    // Deliberately read here rather than in before_agent_start: the runner
+    // hands each before_agent_start handler the prompt as it stands mid-chain,
+    // so extensions registered after this one may still rewrite it. By
+    // agent_start the session has applied the final override and
+    // ctx.getSystemPrompt() returns the prompt actually sent to the model.
+    let raw: unknown;
+    try {
+      // Optional call: older pi versions have no getSystemPrompt on the context.
+      raw = ctx.getSystemPrompt?.();
+    } catch {
+      return;
+    }
+    if (typeof raw !== "string" || !raw.trim()) return;
+    // Stored full, not truncated: unlike user/tool outputs (unbounded, can be
+    // megabytes) the system prompt is the debugging subject itself. Redaction
+    // still applies, both here and again via the processor mask on export.
+    const systemPrompt = redactLangfuseKeys(raw) as string;
+    state.systemPrompt = systemPrompt;
+    try {
+      state.root.update({ metadata: { system_prompt: systemPrompt } });
+    } catch {
+      // Tracing must never break the session.
+    }
+    debug("system prompt captured", raw.length, "->", systemPrompt.length);
+  });
+
   pi.on("before_provider_request", (_event, ctx) => {
     if (!state) return;
     // A new provider request while one is open means the previous HTTP
@@ -664,12 +693,17 @@ export default function (pi: ExtensionAPI) {
       gen.obs.end();
     }
     const index = ++state.generationCount;
-    const generationInput =
+    const baseInput =
       index === 1
         ? { role: "user", content: lastPromptText }
         : state.pendingToolResults.length
           ? { role: "tool", tool_results: state.pendingToolResults }
           : undefined;
+    // Head every generation with the system prompt so the Langfuse UI renders
+    // it as the `> system` block there too, not only in the turn root metadata.
+    const generationInput = state.systemPrompt
+      ? [{ role: "system", content: state.systemPrompt }, ...(baseInput ? [baseInput] : [])]
+      : baseInput;
 
     const obs = state.root.startObservation(
       GENERATION_PREFIX,
