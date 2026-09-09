@@ -290,6 +290,37 @@ export function toMultimodalContent(
   ];
 }
 
+const MAX_TOKENS_KEYS = ["max_tokens", "max_completion_tokens", "max_output_tokens", "maxOutputTokens", "maxTokens"];
+
+function findNumber(bag: unknown, keys: string[], depth = 2): number | undefined {
+  if (!bag || typeof bag !== "object" || Array.isArray(bag)) return undefined;
+  const record = bag as Record<string, unknown>;
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isInteger(value) && value > 0) return value;
+  }
+  if (depth === 0) return undefined;
+  for (const value of Object.values(record)) {
+    const found = findNumber(value, keys, depth - 1);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+export function extractModelParameters(
+  payload: unknown,
+  model: { reasoning?: boolean } | undefined,
+  thinkingLevel?: string,
+): Record<string, string | number> | undefined {
+  const out: Record<string, string | number> = {};
+  try {
+    const maxTokens = findNumber(payload, MAX_TOKENS_KEYS);
+    if (maxTokens !== undefined) out.max_tokens = maxTokens;
+    if (model?.reasoning && thinkingLevel && thinkingLevel !== "off") out.thinking_level = thinkingLevel;
+  } catch {}
+  return Object.keys(out).length ? out : undefined;
+}
+
 export interface PiUsage {
   input: number;
   output: number;
@@ -654,7 +685,7 @@ export default function (pi: ExtensionAPI) {
     debug("root created, turn", turnNumber);
   });
 
-  pi.on("before_provider_request", (_event, ctx) => {
+  pi.on("before_provider_request", (event, ctx) => {
     if (!state) return;
     // A new provider request while one is open means the previous HTTP
     // attempt was retried/superseded — close it instead of leaking it.
@@ -676,6 +707,7 @@ export default function (pi: ExtensionAPI) {
       {
         input: generationInput,
         model: ctx.model?.id,
+        modelParameters: extractModelParameters(event.payload, ctx.model, ctx.thinkingLevel),
         metadata: {
           assistant_index: index - 1,
           ...(ctx.model ? { provider: ctx.model.provider } : {}),
