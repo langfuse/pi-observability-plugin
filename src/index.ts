@@ -1,4 +1,5 @@
 
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -30,6 +31,7 @@ const COMPACTION_OBSERVATION_NAME = "Compaction";
 const BRANCH_SUMMARY_OBSERVATION_NAME = "Branch Summary";
 const TOOL_USAGE_OBSERVATION_NAME = "Tool LLM Usage";
 const BASE_TAGS = ["pi"];
+const MAX_CHARS = Number(process.env.PI_LANGFUSE_MAX_CHARS ?? "20000");
 
 // A data: URI is only worth emitting if the processor swaps it for a media
 // reference; with uploads off it stays in the span as full base64.
@@ -138,6 +140,28 @@ function readConfigFile(): Partial<Record<keyof LangfuseConfig, unknown>> {
 // ---------------------------------------------------------------------------
 // Payload helpers
 // ---------------------------------------------------------------------------
+
+export interface TruncationMeta {
+  truncated: boolean;
+  orig_len: number;
+  kept_len?: number;
+  sha256?: string;
+}
+
+export function truncateText(text: string): { text: string; meta: TruncationMeta } {
+  if (text.length <= MAX_CHARS) {
+    return { text, meta: { truncated: false, orig_len: text.length } };
+  }
+  return {
+    text: text.slice(0, MAX_CHARS),
+    meta: {
+      truncated: true,
+      orig_len: text.length,
+      kept_len: MAX_CHARS,
+      sha256: createHash("sha256").update(text).digest("hex"),
+    },
+  };
+}
 
 const SECRET_REDACTION_MARK = "[redacted-langfuse-secret]";
 const CYCLE_MARK = "[circular-ref]";
@@ -295,11 +319,15 @@ export type ChatMlMessage =
     }
   | { role: "tool"; tool_call_id: string; name: string; content: string; is_error?: true };
 
-export function markDataUris(text: string): string {
-  return text.replace(
+const TOOL_CALL_ARG_LIMIT = 4000;
+
+export function clampForHistory(text: string, limit: number = MAX_CHARS): string {
+  const marked = text.replace(
     /data:[^;,]{0,100};base64,[A-Za-z0-9+/]+=*/g,
     (uri) => `[data uri ~${Math.floor((uri.length * 3) / 4 / 1024)}KB]`,
   );
+  if (marked.length <= limit) return marked;
+  return `${marked.slice(0, limit)}\n[truncated, ${marked.length} chars total]`;
 }
 
 function renderHistoryContent(content: unknown): string {
@@ -322,7 +350,7 @@ function historyToolCalls(content: unknown): ChatMlToolCall[] {
         type: "function" as const,
         function: {
           name: part.name,
-          ...(args ? { arguments: markDataUris(args) } : {}),
+          ...(args ? { arguments: clampForHistory(args, TOOL_CALL_ARG_LIMIT) } : {}),
         },
       };
     });
@@ -338,7 +366,7 @@ export function extractThinking(content: unknown): ChatMlThinkingPart[] {
     if (typeof part.thinking !== "string" || !part.thinking.trim()) continue;
     parts.push({
       type: "thinking",
-      content: markDataUris(part.thinking),
+      content: clampForHistory(part.thinking),
       ...(part.redacted ? { redacted: true as const } : {}),
     });
   }
@@ -355,10 +383,10 @@ export function toChatMlMessage(message: unknown): ChatMlMessage | undefined {
     isError?: unknown;
   };
   if (msg.role === "user") {
-    return { role: "user", content: markDataUris(renderHistoryContent(msg.content)) };
+    return { role: "user", content: clampForHistory(renderHistoryContent(msg.content)) };
   }
   if (msg.role === "assistant") {
-    const content = markDataUris(extractText(msg.content));
+    const content = clampForHistory(extractText(msg.content));
     const thinking = extractThinking(msg.content);
     const toolCalls = historyToolCalls(msg.content);
     if (!content && !thinking.length && !toolCalls.length) return undefined;
@@ -374,7 +402,7 @@ export function toChatMlMessage(message: unknown): ChatMlMessage | undefined {
       role: "tool",
       tool_call_id: typeof msg.toolCallId === "string" ? msg.toolCallId : "",
       name: typeof msg.toolName === "string" ? msg.toolName : "",
-      content: markDataUris(renderHistoryContent(msg.content)),
+      content: clampForHistory(renderHistoryContent(msg.content)),
       ...(msg.isError ? { is_error: true as const } : {}),
     };
   }
@@ -638,13 +666,15 @@ export default function (pi: ExtensionAPI) {
   const finalizeRoot = (opts: { cancelled: boolean }) => {
     if (!state) return;
     closeDanglingObservations("interrupted");
+    const { text, meta } = truncateText(state.lastAssistantText ?? "");
     const media = EMIT_IMAGE_MEDIA ? state.turnImages : [];
     if (media.length) sessionHadImages = true;
     state.root.update({
       input: media.length ? { role: "user", content: toMultimodalContent(state.userText, media) } : undefined,
-      output: state.lastAssistantText ? { role: "assistant", content: state.lastAssistantText } : undefined,
+      output: state.lastAssistantText ? { role: "assistant", content: text } : undefined,
       level: state.sawError ? "ERROR" : undefined,
       metadata: {
+        assistant_text_meta: meta,
         ...(state.turnImages.length ? { image_count: state.turnImages.length } : {}),
         ...(opts.cancelled ? { cancelled: true } : {}),
       },
@@ -706,7 +736,8 @@ export default function (pi: ExtensionAPI) {
     const sessionId = ctx.sessionManager.getSessionId();
     const turnNumber = resolveTurnNumber(ctx, event.prompt);
     const promptImages = extractImages(event.images);
-    const userText = [event.prompt, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
+    const { text: promptText, meta: userMeta } = truncateText(event.prompt);
+    const userText = [promptText, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
     lastPromptText = userText;
     lastContextHistory = undefined;
     const isSubagent = Boolean(inheritedParent);
@@ -730,6 +761,7 @@ export default function (pi: ExtensionAPI) {
           session_id: sessionId,
           turn_number: turnNumber,
           cwd: ctx.cwd,
+          user_text_meta: userMeta,
           ...(gitBranch ? { git_branch: gitBranch } : {}),
           ...(ctx.model ? { model: ctx.model.id, provider: ctx.model.provider } : {}),
           ...(isSubagent
@@ -824,13 +856,14 @@ export default function (pi: ExtensionAPI) {
 
     const text = extractText(message.content);
     const tools = extractToolCalls(message.content);
+    const { text: outText, meta: outMeta } = truncateText(text);
     const isError = message.stopReason === "error" || message.stopReason === "aborted";
     if (message.stopReason === "error") state.sawError = true;
 
     gen.obs.update({
       output: {
         role: "assistant",
-        ...(text ? { content: text } : {}),
+        ...(outText ? { content: outText } : {}),
         ...(tools.length ? { tool_calls: tools } : {}),
       },
       model: message.responseModel || message.model,
@@ -843,6 +876,7 @@ export default function (pi: ExtensionAPI) {
           }
         : {}),
       metadata: {
+        assistant_text_meta: outMeta,
         tool_count: tools.length,
         ...(message.stopReason ? { stop_reason: message.stopReason } : {}),
         ...(message.responseId ? { response_id: message.responseId } : {}),
@@ -866,7 +900,16 @@ export default function (pi: ExtensionAPI) {
     const serializedArgs = safeStringify(redactedArgs);
     const hasDataUri = /data:[^;,]{0,100};base64,/.test(serializedArgs);
     let input: unknown = redactedArgs;
-    if (hasDataUri) input = markDataUris(serializedArgs);
+    let argsMeta: TruncationMeta | undefined;
+    if (hasDataUri || serializedArgs.length > MAX_CHARS) {
+      const marked = serializedArgs.replace(
+        /data:[^;,]{0,100};base64,[A-Za-z0-9+/]+=*/g,
+        (uri) => `[data uri ~${Math.floor((uri.length * 3) / 4 / 1024)}KB]`,
+      );
+      const t = truncateText(marked);
+      input = t.text;
+      argsMeta = t.meta;
+    }
     const obs = state.root.startObservation(
       `${TOOL_PREFIX} ${event.toolName}`,
       {
@@ -874,6 +917,7 @@ export default function (pi: ExtensionAPI) {
         metadata: {
           tool_name: event.toolName,
           tool_id: event.toolCallId,
+          ...(argsMeta ? { args_meta: argsMeta } : {}),
         },
       },
       { asType: "tool" },
@@ -890,6 +934,7 @@ export default function (pi: ExtensionAPI) {
     const result = event.result as { content?: unknown; usage?: PiUsage } | undefined;
     const images = extractImages(result?.content);
     const rawOutput = renderContentWithImageMarkers(result?.content) || safeStringify(result?.content);
+    const { text: outText, meta: outMeta } = truncateText(rawOutput);
     if (event.isError) state.sawError = true;
     state.turnImages.push(...images);
 
@@ -922,9 +967,10 @@ export default function (pi: ExtensionAPI) {
     }
 
     open.obs.update({
-      output: rawOutput || undefined,
+      output: outText || undefined,
       ...(event.isError ? { level: "ERROR" as const, statusMessage: "Tool execution failed" } : {}),
       metadata: {
+        output_meta: outMeta,
         is_error: Boolean(event.isError),
         ...(images.length ? { image_count: images.length } : {}),
       },
@@ -934,7 +980,7 @@ export default function (pi: ExtensionAPI) {
     state.pendingToolResults.push({
       tool_call_id: event.toolCallId,
       name: open.name,
-      content: rawOutput,
+      content: outText.slice(0, 4000),
     });
   });
 
@@ -1002,7 +1048,7 @@ export default function (pi: ExtensionAPI) {
       | { summary?: string; tokensBefore?: number; usage?: PiUsage; fromHook?: boolean }
       | undefined;
     const usage = entry?.usage;
-    const summaryText = entry?.summary ?? "";
+    const { text: summaryText, meta: summaryMeta } = truncateText(entry?.summary ?? "");
     emitSummarizationGeneration(
       COMPACTION_OBSERVATION_NAME,
       ctx,
@@ -1019,6 +1065,7 @@ export default function (pi: ExtensionAPI) {
           ...(entry?.fromHook ? { from_hook: true } : {}),
           ...(typeof entry?.tokensBefore === "number" ? { tokens_before: entry.tokensBefore } : {}),
           ...(ctx.model ? { provider: ctx.model.provider } : {}),
+          summary_meta: summaryMeta,
         },
       },
       startedAt,
@@ -1035,7 +1082,7 @@ export default function (pi: ExtensionAPI) {
       | undefined;
     if (!entry) return; // plain navigation without a summarization call
     const usage = entry.usage;
-    const summaryText = entry.summary ?? "";
+    const { text: summaryText, meta: summaryMeta } = truncateText(entry.summary ?? "");
     emitSummarizationGeneration(
       BRANCH_SUMMARY_OBSERVATION_NAME,
       ctx,
@@ -1049,6 +1096,7 @@ export default function (pi: ExtensionAPI) {
           ...(entry.fromHook ? { from_hook: true } : {}),
           ...(usage?.cacheWrite1h ? { cache_write_1h_tokens: usage.cacheWrite1h } : {}),
           ...(ctx.model ? { provider: ctx.model.provider } : {}),
+          summary_meta: summaryMeta,
         },
       },
     );

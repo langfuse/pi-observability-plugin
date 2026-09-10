@@ -661,40 +661,4 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       capture.close();
     }
   });
-
-  it("traces a long tool result whole, past the old 20k budget", async () => {
-    const capture = await startCaptureServer();
-    try {
-      const sandbox = createSandbox(mock.port, { readmeFillerLines: 400 });
-      const result = await runPi(sandbox, "Explore this project and summarize it", {
-        env: buildLangfuseEnv(capture),
-      });
-      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
-      await waitForRequests(capture, 1);
-      const spans = capture.spans();
-
-      const read = findSpansByName(spans, "Tool: read")[0]!;
-      const output = String(read.attrs["langfuse.observation.output"]);
-      assert.ok(output.length > 20_000, `expected the whole README, got ${output.length} chars`);
-      assert.ok(!output.includes("truncated"), "no truncation marker may reach a span");
-      assert.equal(read.attrs["langfuse.observation.metadata.output_meta"], undefined);
-
-      const generations = byStart(findSpansByName(spans, "LLM Call"));
-      const history = inputOf(generations[2]!);
-      const toolMessage = history.find(
-        (m) => m.role === "tool" && (m.content ?? "").includes("This paragraph is filler"),
-      );
-      assert.ok(toolMessage, "the long tool result must appear in the history");
-      assert.ok(
-        (toolMessage!.content ?? "").length > 20_000,
-        `history copy was shortened to ${(toolMessage!.content ?? "").length} chars`,
-      );
-
-      const exported = JSON.stringify(capture.requests);
-      assert.ok(!exported.includes("assistant_text_meta"), "truncation metadata must be gone");
-      assert.ok(!exported.includes("output_meta"), "truncation metadata must be gone");
-    } finally {
-      capture.close();
-    }
-  });
 });

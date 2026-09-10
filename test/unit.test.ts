@@ -10,14 +10,33 @@ import {
   renderContentWithImageMarkers,
   extractToolCalls,
   toMultimodalContent,
+  truncateText,
   buildUsageDetails,
   buildHistoryInput,
-  markDataUris,
+  clampForHistory,
   extractThinking,
   toChatMlMessage,
   type ChatMlMessage,
   type PiUsage,
 } from "../src/index.ts";
+
+describe("truncateText", () => {
+  it("keeps short text untouched and records the original length", () => {
+    const { text, meta } = truncateText("hello");
+    assert.equal(text, "hello");
+    assert.deepEqual(meta, { truncated: false, orig_len: 5 });
+  });
+
+  it("head-truncates long text and records kept_len + sha256 of the full text", () => {
+    const long = "x".repeat(30_000);
+    const { text, meta } = truncateText(long);
+    assert.equal(text.length, 20_000);
+    assert.equal(meta.truncated, true);
+    assert.equal(meta.orig_len, 30_000);
+    assert.equal(meta.kept_len, 20_000);
+    assert.match(meta.sha256 ?? "", /^[a-f0-9]{64}$/);
+  });
+});
 
 describe("createSecretRedactor", () => {
   it("redacts Langfuse key tokens in plain strings", () => {
@@ -416,19 +435,22 @@ describe("readInheritedParent", () => {
   });
 });
 
-describe("markDataUris", () => {
-  it("leaves plain text untouched, however long", () => {
-    assert.equal(markDataUris("hello"), "hello");
-    const long = "x".repeat(120_000);
-    assert.equal(markDataUris(long), long);
+describe("clampForHistory", () => {
+  it("leaves text below the budget untouched", () => {
+    assert.equal(clampForHistory("hello"), "hello");
   });
 
-  it("collapses a data URI to a size marker", () => {
+  it("collapses a data URI to a size marker before any truncation", () => {
     const uri = `data:image/png;base64,${"A".repeat(4000)}`;
-    const marked = markDataUris(`before ${uri} after`);
-    assert.ok(!marked.includes("AAAA"), "no base64 may survive into a history copy");
-    assert.match(marked, /\[data uri ~2KB\]/);
-    assert.equal(marked, "before [data uri ~2KB] after");
+    const clamped = clampForHistory(`before ${uri} after`, 100);
+    assert.ok(!clamped.includes("AAAA"), "no base64 may survive into a history copy");
+    assert.match(clamped, /\[data uri ~2KB\]/);
+    assert.ok(clamped.startsWith("before "), "surrounding text is kept");
+  });
+
+  it("marks a truncation instead of cutting silently", () => {
+    const clamped = clampForHistory("x".repeat(50), 10);
+    assert.equal(clamped, `${"x".repeat(10)}\n[truncated, 50 chars total]`);
   });
 });
 
@@ -619,13 +641,12 @@ describe("buildHistoryInput", () => {
     assert.equal(buildHistoryInput([{ role: "unknown" }] as never), undefined);
   });
 
-  it("never shortens a message, however long", () => {
+  it("clamps each message on its own rather than the history as a whole", () => {
     const history = buildHistoryInput([
-      { role: "user", content: [{ type: "text", text: "y".repeat(120_000) }], timestamp: 1 },
+      { role: "user", content: [{ type: "text", text: "y".repeat(30_000) }], timestamp: 1 },
       { role: "user", content: [{ type: "text", text: "short" }], timestamp: 2 },
     ] as never) as ChatMlMessage[];
-    assert.equal((history[0] as { content: string }).content.length, 120_000);
-    assert.ok(!JSON.stringify(history).includes("truncated"));
+    assert.match((history[0] as { content: string }).content, /\[truncated, 30000 chars total\]/);
     assert.equal((history[1] as { content: string }).content, "short");
   });
 });
@@ -679,8 +700,8 @@ describe("extractThinking", () => {
     assert.deepEqual(extractThinking([null, 42, { type: "thinking" }, { type: "thinking", thinking: 7 }]), []);
   });
 
-  it("keeps a long reasoning block whole", () => {
-    const parts = extractThinking([{ type: "thinking", thinking: "z".repeat(120_000) }]);
-    assert.equal(parts[0]!.content.length, 120_000);
+  it("clamps a long reasoning block like any other history text", () => {
+    const parts = extractThinking([{ type: "thinking", thinking: "z".repeat(30_000) }]);
+    assert.match(parts[0]!.content, /\[truncated, 30000 chars total\]/);
   });
 });
