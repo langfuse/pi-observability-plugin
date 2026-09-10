@@ -11,8 +11,11 @@ import { after, before, describe, it } from "node:test";
 import {
   type Capture,
   type CapturedSpan,
+  type MockProvider,
+  type OpenAiMessage,
   REPO_ROOT,
   createSandbox,
+  FINAL_ANSWER_THINKING,
   SUMMARIZATION_USAGE,
   runPi,
   startCaptureServer,
@@ -33,8 +36,67 @@ function findSpansByName(spans: CapturedSpan[], name: string): CapturedSpan[] {
   return spans.filter((s) => s.name === name);
 }
 
+function byStart(spans: CapturedSpan[]): CapturedSpan[] {
+  return [...spans].sort((a, b) => (a.startNs < b.startNs ? -1 : 1));
+}
+
+interface TracedMessage {
+  role: string;
+  content?: string;
+  thinking?: Array<{ type: string; content: string; redacted?: true }>;
+  tool_calls?: Array<{ id: string; type: string; function: { name: string; arguments?: string } }>;
+  tool_call_id?: string;
+  name?: string;
+}
+
+function inputOf(span: CapturedSpan): TracedMessage[] {
+  const raw = span.attrs["langfuse.observation.input"];
+  const parsed: unknown = typeof raw === "string" ? JSON.parse(raw) : raw;
+  return Array.isArray(parsed) ? (parsed as TracedMessage[]) : [parsed as TracedMessage];
+}
+
+function contentsOf(span: CapturedSpan): string[] {
+  return inputOf(span).map((m) => m.content ?? "");
+}
+
+function wireText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => (part as { type?: string; text?: string }))
+    .filter((part) => part.type === "text")
+    .map((part) => part.text ?? "")
+    .join("");
+}
+
+function normalizeWire(messages: OpenAiMessage[]): unknown[] {
+  return messages
+    .filter((m) => m.role !== "system")
+    .map((m) => ({
+      role: m.role,
+      text: wireText(m.content),
+      ...(m.tool_calls
+        ? { calls: m.tool_calls.map((t) => `${t.function?.name}(${t.function?.arguments})`) }
+        : {}),
+      ...(m.tool_call_id ? { toolCallId: m.tool_call_id } : {}),
+      ...(m.reasoning_content ? { reasoning: m.reasoning_content } : {}),
+    }));
+}
+
+function normalizeTraced(messages: TracedMessage[]): unknown[] {
+  return messages.map((m) => ({
+    role: m.role,
+    text: m.content ?? "",
+    ...(m.tool_calls
+      ? { calls: m.tool_calls.map((t) => `${t.function.name}(${t.function.arguments})`) }
+      : {}),
+    ...(m.tool_call_id ? { toolCallId: m.tool_call_id } : {}),
+    ...(m.thinking ? { reasoning: m.thinking.map((t) => t.content).join("\n") } : {}),
+  }));
+}
+
 describe("integration: pi -> extension -> Langfuse export", () => {
-  let mock: { port: number; close: () => void };
+  let mock: MockProvider;
 
   before(async () => {
     mock = await startMockProvider();
@@ -266,6 +328,32 @@ describe("integration: pi -> extension -> Langfuse export", () => {
         subagentChildren.some((s) => s.attrs["langfuse.observation.type"] === "generation"),
         "the subagent's generations must be nested under it",
       );
+
+      const subagentGenerations = byStart(
+        subagentChildren.filter((s) => s.name === "LLM Call"),
+      );
+      assert.ok(subagentGenerations.length >= 1, "the subagent must have at least one generation");
+      for (const generation of subagentGenerations) {
+        assert.equal(
+          generation.attrs["langfuse.observation.metadata.input_source"],
+          "context",
+          "a session-less subagent run still gets its history from the context",
+        );
+        const history = inputOf(generation);
+        assert.equal(history[0]!.role, "user");
+        assert.match(String(history[0]!.content), /^Task: inspect the repository/);
+        assert.ok(
+          !contentsOf(generation).some((c) => c.includes("Delegate the repo inspection")),
+          "the parent's prompt must not leak into the subagent's history",
+        );
+      }
+      const parentGenerations = byStart(
+        spans.filter((s) => s.name === "LLM Call" && s.parentSpanId === parentRoot!.spanId),
+      );
+      assert.ok(
+        contentsOf(parentGenerations[0]!).some((c) => c.includes("Delegate the repo inspection")),
+        "the parent keeps its own prompt in its own history",
+      );
       for (const span of subagentChildren) {
         assert.equal(span.traceId, parentRoot!.traceId, `${span.name} must stay in the parent trace`);
       }
@@ -357,6 +445,254 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       assert.equal(compaction.parentSpanId, root.spanId);
       assert.equal(compaction.traceId, root.traceId);
       assert.equal(compaction.attrs["langfuse.observation.metadata.compaction_reason"], "threshold");
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("gives every generation the conversation up to that call, not only the delta", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const result = await runPi(sandbox, "Explore this project and summarize it", {
+        env: buildLangfuseEnv(capture),
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+      await waitForRequests(capture, 1);
+      const generations = byStart(findSpansByName(capture.spans(), "LLM Call"));
+      assert.equal(generations.length, 3);
+
+      assert.deepEqual(
+        generations.map((g) => inputOf(g).length),
+        [1, 3, 5],
+      );
+      for (const generation of generations) {
+        assert.equal(
+          generation.attrs["langfuse.observation.metadata.input_source"],
+          "context",
+          "the history must come from pi's own context, never the delta fallback",
+        );
+      }
+      assert.equal(
+        Number(generations[2]!.attrs["langfuse.observation.metadata.history_message_count"]),
+        5,
+      );
+
+      for (const generation of generations) {
+        const first = inputOf(generation)[0]!;
+        assert.equal(first.role, "user");
+        assert.equal(first.content, "Explore this project and summarize it");
+      }
+
+      const last = inputOf(generations[2]!);
+      assert.deepEqual(last.map((m) => m.role), ["user", "assistant", "tool", "assistant", "tool"]);
+      assert.deepEqual(
+        last.filter((m) => m.role === "tool").map((m) => m.name),
+        ["bash", "read"],
+      );
+      assert.deepEqual(
+        last.flatMap((m) => m.tool_calls?.map((t) => `${t.function.name} ${t.function.arguments}`) ?? []),
+        ['bash {"command":"ls"}', 'read {"path":"README.md"}'],
+      );
+      for (const call of last.flatMap((m) => m.tool_calls ?? [])) {
+        assert.equal(call.type, "function");
+        assert.ok(call.id, "a tool call must keep its id");
+      }
+
+      const root = findSpansByName(capture.spans(), "Conversational Turn")[0]!;
+      assert.deepEqual(JSON.parse(String(root.attrs["langfuse.observation.input"])), {
+        role: "user",
+        content: "Explore this project and summarize it",
+      });
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("matches the conversation the provider actually received", async () => {
+    const capture = await startCaptureServer();
+    const firstCall = mock.sentMessages.length;
+    try {
+      const sandbox = createSandbox(mock.port);
+      const result = await runPi(sandbox, "Explore this project and summarize it", {
+        env: buildLangfuseEnv(capture),
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+      await waitForRequests(capture, 1);
+      const generations = byStart(findSpansByName(capture.spans(), "LLM Call"));
+      const sent = mock.sentMessages.slice(firstCall);
+      assert.equal(sent.length, generations.length, "one provider request per generation");
+
+      for (const [index, generation] of generations.entries()) {
+        assert.deepEqual(
+          normalizeTraced(inputOf(generation)),
+          normalizeWire(sent[index]!),
+          `generation ${index + 1} input must equal the provider request`,
+        );
+      }
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("keeps the history complete when the plugin restarts mid-session", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const env = buildLangfuseEnv(capture);
+      assert.equal((await runPi(sandbox, "First prompt", { env })).status, 0);
+      assert.equal((await runPi(sandbox, "Second prompt", { env, continue: true })).status, 0);
+      await waitForRequests(capture, 2);
+
+      const roots = byStart(findSpansByName(capture.spans(), "Conversational Turn"));
+      assert.equal(roots.length, 2);
+      const secondTurn = byStart(
+        findSpansByName(capture.spans(), "LLM Call").filter((s) => s.traceId === roots[1]!.traceId),
+      );
+      assert.equal(secondTurn.length, 3);
+
+      const first = inputOf(secondTurn[0]!);
+      assert.equal(first.length, 7, "turn 1 (5 messages) plus the new prompt and its first step");
+      assert.equal(first[0]!.content, "First prompt", "turn 1's prompt must still be there");
+      assert.deepEqual(
+        contentsOf(secondTurn[0]!).filter((c) => c === "First prompt" || c === "Second prompt"),
+        ["First prompt", "Second prompt"],
+        "both turns appear, in order",
+      );
+      assert.equal(inputOf(secondTurn[2]!).length, 11);
+      for (const generation of secondTurn) {
+        assert.equal(generation.attrs["langfuse.observation.metadata.input_source"], "context");
+      }
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("carries the compaction summary after a compaction, not the messages it replaced", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port, {
+        contextWindow: 18000,
+        keepRecentTokens: 300,
+        readmeFillerLines: 200,
+      });
+      const env = buildLangfuseEnv(capture);
+      assert.equal((await runPi(sandbox, "Explore this project and summarize it", { env })).status, 0);
+      assert.equal((await runPi(sandbox, "What did we conclude?", { env, continue: true })).status, 0);
+      await waitForRequests(capture, 2);
+
+      const spans = capture.spans();
+      assert.equal(findSpansByName(spans, "Compaction").length > 0, true, "a compaction must have happened");
+      const roots = byStart(findSpansByName(spans, "Conversational Turn"));
+      assert.equal(roots.length, 2);
+
+      const beforeCompaction = byStart(
+        findSpansByName(spans, "LLM Call").filter((s) => s.traceId === roots[0]!.traceId),
+      );
+      const filler = "This paragraph is filler";
+      assert.ok(
+        contentsOf(beforeCompaction[2]!).some((c) => c.includes(filler)),
+        "the pre-compaction turn does carry the long tool result",
+      );
+
+      const afterCompaction = byStart(
+        findSpansByName(spans, "LLM Call").filter((s) => s.traceId === roots[1]!.traceId),
+      );
+      const first = inputOf(afterCompaction[0]!);
+      assert.equal(first[0]!.role, "user");
+      assert.match(
+        first[0]!.content ?? "",
+        /compacted into the following summary/,
+        "the summary the model sees must be the first message",
+      );
+      assert.equal(
+        first.length,
+        3,
+        "summary + kept entries + the new prompt, not the five messages the summary replaced",
+      );
+      assert.equal(first.at(-1)!.content, "What did we conclude?");
+      assert.ok(
+        !contentsOf(afterCompaction[0]!).some((c) => c.includes(filler)),
+        "content the compaction dropped must not reappear in the history",
+      );
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("attaches the assistant reasoning to the step that produced it", async () => {
+    const capture = await startCaptureServer();
+    const firstCall = mock.sentMessages.length;
+    try {
+      const sandbox = createSandbox(mock.port);
+      const env = buildLangfuseEnv(capture);
+      assert.equal((await runPi(sandbox, "Explore this project and summarize it", { env })).status, 0);
+      assert.equal((await runPi(sandbox, "And the filler text?", { env, continue: true })).status, 0);
+      await waitForRequests(capture, 2);
+
+      const roots = byStart(findSpansByName(capture.spans(), "Conversational Turn"));
+      const secondTurn = byStart(
+        findSpansByName(capture.spans(), "LLM Call").filter((s) => s.traceId === roots[1]!.traceId),
+      );
+      const history = inputOf(secondTurn[0]!);
+
+      const reasoning = history.filter((m) => m.thinking);
+      assert.equal(reasoning.length, 1, "only the step that reasoned carries a thinking block");
+      assert.deepEqual(reasoning[0]!.thinking, [{ type: "thinking", content: FINAL_ANSWER_THINKING }]);
+      assert.equal(
+        reasoning[0]!.content,
+        "This is the test workspace. Done.",
+        "the reasoning rides next to that step's text, not instead of it",
+      );
+      assert.ok(
+        !contentsOf(secondTurn[0]!).some((c) => c.includes(FINAL_ANSWER_THINKING)),
+        "reasoning must not be mixed into the message content",
+      );
+
+      const exported = JSON.stringify(capture.requests);
+      assert.ok(!exported.includes("thinkingSignature"), "the signature blob must not be traced");
+      assert.ok(!exported.includes("reasoning_content"), "the raw provider field must not be traced");
+
+      const sent = mock.sentMessages.slice(firstCall);
+      const withReasoning = sent.at(-1)!.filter((m) => m.reasoning_content);
+      assert.equal(withReasoning.length, 1);
+      assert.equal(withReasoning[0]!.reasoning_content, FINAL_ANSWER_THINKING);
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("traces a long tool result whole, past the old 20k budget", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port, { readmeFillerLines: 400 });
+      const result = await runPi(sandbox, "Explore this project and summarize it", {
+        env: buildLangfuseEnv(capture),
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+      await waitForRequests(capture, 1);
+      const spans = capture.spans();
+
+      const read = findSpansByName(spans, "Tool: read")[0]!;
+      const output = String(read.attrs["langfuse.observation.output"]);
+      assert.ok(output.length > 20_000, `expected the whole README, got ${output.length} chars`);
+      assert.ok(!output.includes("truncated"), "no truncation marker may reach a span");
+      assert.equal(read.attrs["langfuse.observation.metadata.output_meta"], undefined);
+
+      const generations = byStart(findSpansByName(spans, "LLM Call"));
+      const history = inputOf(generations[2]!);
+      const toolMessage = history.find(
+        (m) => m.role === "tool" && (m.content ?? "").includes("This paragraph is filler"),
+      );
+      assert.ok(toolMessage, "the long tool result must appear in the history");
+      assert.ok(
+        (toolMessage!.content ?? "").length > 20_000,
+        `history copy was shortened to ${(toolMessage!.content ?? "").length} chars`,
+      );
+
+      const exported = JSON.stringify(capture.requests);
+      assert.ok(!exported.includes("assistant_text_meta"), "truncation metadata must be gone");
+      assert.ok(!exported.includes("output_meta"), "truncation metadata must be gone");
     } finally {
       capture.close();
     }

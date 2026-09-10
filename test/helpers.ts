@@ -26,9 +26,18 @@ const EXTENSION = join(REPO_ROOT, "src", "index.ts");
 // Mock OpenAI-compatible provider
 // --------------------------------------------------------------------------
 
-interface OpenAiMessage {
+export interface OpenAiMessage {
   role: string;
   content?: unknown;
+  tool_call_id?: string;
+  tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>;
+  reasoning_content?: string;
+}
+
+export interface MockProvider {
+  port: number;
+  close: () => void;
+  sentMessages: OpenAiMessage[][];
 }
 
 function writeSseEvent(res: http.ServerResponse, obj: unknown) {
@@ -38,10 +47,22 @@ function writeSseEvent(res: http.ServerResponse, obj: unknown) {
 function streamChunks(
   res: http.ServerResponse,
   model: string,
-  parts: { text?: string; tool?: { name: string; args: unknown }; finish: string; usage: unknown },
+  parts: {
+    text?: string;
+    thinking?: string;
+    tool?: { name: string; args: unknown };
+    finish: string;
+    usage: unknown;
+  },
 ) {
   const base = { id: "chatcmpl-mock", object: "chat.completion.chunk", created: 1, model };
   writeSseEvent(res, { ...base, choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] });
+  if (parts.thinking) {
+    writeSseEvent(res, {
+      ...base,
+      choices: [{ index: 0, delta: { reasoning_content: parts.thinking }, finish_reason: null }],
+    });
+  }
   if (parts.text) {
     writeSseEvent(res, { ...base, choices: [{ index: 0, delta: { content: parts.text }, finish_reason: null }] });
   }
@@ -75,7 +96,11 @@ function streamChunks(
 /** Usage the mock reports for a compaction/branch summarization call. */
 export const SUMMARIZATION_USAGE = { prompt: 3571, completion: 313 };
 
-export function startMockProvider(): Promise<{ port: number; close: () => void }> {
+export const FINAL_ANSWER_THINKING =
+  "The workspace holds a single README, so a one-line summary answers the prompt.";
+
+export function startMockProvider(): Promise<MockProvider> {
+  const sentMessages: OpenAiMessage[][] = [];
   const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -86,6 +111,7 @@ export function startMockProvider(): Promise<{ port: number; close: () => void }
         tools?: Array<{ function?: { name?: string } }>;
       };
       const messages = payload.messages ?? [];
+      sentMessages.push(messages);
       const model = payload.model ?? "mock-gpt-1";
       const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
       const stage = messages.slice(lastUserIdx + 1).filter((m) => m.role === "tool").length;
@@ -159,6 +185,7 @@ export function startMockProvider(): Promise<{ port: number; close: () => void }
         });
       } else {
         streamChunks(res, model, {
+          thinking: FINAL_ANSWER_THINKING,
           text: "This is the test workspace. Done.",
           finish: "stop",
           usage: usage(1600, 78, 1280, 30),
@@ -169,7 +196,7 @@ export function startMockProvider(): Promise<{ port: number; close: () => void }
   return new Promise((resolvePromise) => {
     server.listen(0, "127.0.0.1", () => {
       const port = (server.address() as { port: number }).port;
-      resolvePromise({ port, close: () => server.close() });
+      resolvePromise({ port, sentMessages, close: () => server.close() });
     });
   });
 }
