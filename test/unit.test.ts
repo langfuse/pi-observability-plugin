@@ -12,6 +12,11 @@ import {
   toMultimodalContent,
   truncateText,
   buildUsageDetails,
+  buildHistoryInput,
+  markDataUris,
+  extractThinking,
+  toChatMlMessage,
+  type ChatMlMessage,
   type PiUsage,
 } from "../src/index.ts";
 
@@ -427,5 +432,272 @@ describe("readInheritedParent", () => {
     const base = { LANGFUSE_PI_PARENT_TRACE_ID: traceId, LANGFUSE_PI_PARENT_SPAN_ID: spanId };
     assert.equal(readInheritedParent(base)?.depth, 0);
     assert.equal(readInheritedParent({ ...base, LANGFUSE_PI_PARENT_DEPTH: "abc" })?.depth, 0);
+  });
+});
+
+describe("markDataUris", () => {
+  it("leaves plain text untouched, however long", () => {
+    assert.equal(markDataUris("hello"), "hello");
+    const long = "x".repeat(120_000);
+    assert.equal(markDataUris(long), long);
+  });
+
+  it("collapses a data URI to a size marker", () => {
+    const uri = `data:image/png;base64,${"A".repeat(4000)}`;
+    const marked = markDataUris(`before ${uri} after`);
+    assert.ok(!marked.includes("AAAA"), "no base64 may survive into a history copy");
+    assert.equal(marked, "before [data uri ~2KB] after");
+  });
+});
+
+describe("toChatMlMessage", () => {
+  it("renders a user message from content parts, images as markers", () => {
+    const message = toChatMlMessage({
+      role: "user",
+      content: [
+        { type: "text", text: "look at this" },
+        { type: "image", data: "QUJD", mimeType: "image/png" },
+      ],
+    });
+    assert.deepEqual(message, { role: "user", content: "look at this\n[image image/png ~0KB]" });
+  });
+
+  it("keeps a plain string user content as it is", () => {
+    assert.deepEqual(toChatMlMessage({ role: "user", content: "hi" }), { role: "user", content: "hi" });
+  });
+
+  it("carries the assistant text and its tool calls with serialized arguments", () => {
+    const message = toChatMlMessage({
+      role: "assistant",
+      content: [
+        { type: "text", text: "Looking. " },
+        { type: "toolCall", id: "call_1", name: "bash", arguments: { command: "ls" } },
+      ],
+    });
+    assert.deepEqual(message, {
+      role: "assistant",
+      content: "Looking. ",
+      tool_calls: [
+        { id: "call_1", type: "function", function: { name: "bash", arguments: '{"command":"ls"}' } },
+      ],
+    });
+  });
+
+  it("redacts Langfuse keys out of tool call arguments", () => {
+    const message = toChatMlMessage({
+      role: "assistant",
+      content: [{ type: "toolCall", id: "c", name: "bash", arguments: { command: "echo sk-lf-deadbeef" } }],
+    });
+    const args =
+      (message as { tool_calls?: Array<{ function?: { arguments?: string } }> }).tool_calls?.[0]?.function
+        ?.arguments ?? "";
+    assert.ok(!args.includes("sk-lf-deadbeef"), "a secret must not reach the history");
+    assert.match(args, /redacted-langfuse-secret/);
+  });
+
+  it("keeps a reasoning-only assistant step", () => {
+    assert.deepEqual(toChatMlMessage({ role: "assistant", content: [{ type: "thinking", thinking: "hmm" }] }), {
+      role: "assistant",
+      thinking: [{ type: "thinking", content: "hmm" }],
+    });
+  });
+
+  it("drops an assistant message that carries nothing at all", () => {
+    assert.equal(toChatMlMessage({ role: "assistant", content: [] }), undefined);
+    assert.equal(
+      toChatMlMessage({ role: "assistant", content: [{ type: "thinking", thinking: "   " }] }),
+      undefined,
+    );
+  });
+
+  it("carries reasoning next to the text and the tool calls of the same step", () => {
+    assert.deepEqual(
+      toChatMlMessage({
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "I should list the files.", thinkingSignature: "sig-abc" },
+          { type: "text", text: "Looking. " },
+          { type: "toolCall", id: "call_1", name: "bash", arguments: { command: "ls" } },
+        ],
+      }),
+      {
+        role: "assistant",
+        content: "Looking. ",
+        thinking: [{ type: "thinking", content: "I should list the files." }],
+        tool_calls: [
+          { id: "call_1", type: "function", function: { name: "bash", arguments: '{"command":"ls"}' } },
+        ],
+      },
+    );
+  });
+
+  it("maps a tool result onto the ChatML tool role and flags failures", () => {
+    assert.deepEqual(
+      toChatMlMessage({
+        role: "toolResult",
+        toolCallId: "call_1",
+        toolName: "bash",
+        content: [{ type: "text", text: "no such file" }],
+        isError: true,
+      }),
+      { role: "tool", tool_call_id: "call_1", name: "bash", content: "no such file", is_error: true },
+    );
+  });
+
+  it("drops an unknown role rather than guessing at its shape", () => {
+    assert.equal(toChatMlMessage({ role: "somethingNew", content: "x" }), undefined);
+    assert.equal(toChatMlMessage(undefined), undefined);
+    assert.equal(toChatMlMessage("not a message"), undefined);
+  });
+});
+
+describe("buildHistoryInput", () => {
+  const conversation = [
+    { role: "user", content: [{ type: "text", text: "explore this" }], timestamp: 1 },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Looking. " },
+        { type: "toolCall", id: "call_1", name: "bash", arguments: { command: "ls" } },
+      ],
+      timestamp: 2,
+    },
+    {
+      role: "toolResult",
+      toolCallId: "call_1",
+      toolName: "bash",
+      content: [{ type: "text", text: "README.md" }],
+      isError: false,
+      timestamp: 3,
+    },
+  ];
+
+  it("converts a conversation in order", () => {
+    const history = buildHistoryInput(structuredClone(conversation) as never);
+    assert.deepEqual(history?.map((m) => m.role), ["user", "assistant", "tool"]);
+    assert.equal((history?.[0] as { content: string }).content, "explore this");
+  });
+
+  it("never mutates the messages pi is about to send", () => {
+    const messages = structuredClone(conversation);
+    const before = JSON.stringify(messages);
+    buildHistoryInput(messages as never);
+    assert.equal(JSON.stringify(messages), before);
+  });
+
+  it("renders a compaction summary as the user message the model actually sees", () => {
+    const history = buildHistoryInput([
+      { role: "compactionSummary", summary: "Earlier work.", tokensBefore: 1234, timestamp: 1 },
+      { role: "user", content: [{ type: "text", text: "and now?" }], timestamp: 2 },
+    ] as never);
+    assert.equal(history?.length, 2);
+    const summary = history?.[0] as { role: string; content: string };
+    assert.equal(summary.role, "user");
+    assert.match(summary.content, /compacted into the following summary/);
+    assert.match(summary.content, /Earlier work\./);
+  });
+
+  it("leaves out bash output that is excluded from the request", () => {
+    const history = buildHistoryInput([
+      { role: "user", content: [{ type: "text", text: "hi" }], timestamp: 1 },
+      {
+        role: "bashExecution",
+        command: "ls",
+        output: "secret-local-output",
+        exitCode: 0,
+        cancelled: false,
+        truncated: false,
+        excludeFromContext: true,
+        timestamp: 2,
+      },
+    ] as never);
+    assert.equal(history?.length, 1, "a !! bash run is not in the request, so not in the history");
+    assert.ok(!JSON.stringify(history).includes("secret-local-output"));
+  });
+
+  it("includes bash output that is part of the request", () => {
+    const history = buildHistoryInput([
+      {
+        role: "bashExecution",
+        command: "ls",
+        output: "README.md",
+        exitCode: 0,
+        cancelled: false,
+        truncated: false,
+        timestamp: 1,
+      },
+    ] as never);
+    assert.equal(history?.length, 1);
+    assert.equal(history?.[0]?.role, "user");
+  });
+
+  it("returns undefined instead of throwing on an unusable list, so the caller keeps its fallback", () => {
+    assert.equal(buildHistoryInput([] as never), undefined);
+    assert.equal(buildHistoryInput(undefined as never), undefined);
+    assert.equal(buildHistoryInput([{ role: "unknown" }] as never), undefined);
+  });
+
+  it("does not add a length cap of its own to a history message", () => {
+    const history = buildHistoryInput([
+      { role: "user", content: [{ type: "text", text: "y".repeat(120_000) }], timestamp: 1 },
+      { role: "user", content: [{ type: "text", text: "short" }], timestamp: 2 },
+    ] as never) as ChatMlMessage[];
+    assert.equal((history[0] as { content: string }).content.length, 120_000);
+    assert.equal((history[1] as { content: string }).content, "short");
+  });
+});
+
+describe("extractThinking", () => {
+  it("keeps reasoning blocks in transcript order", () => {
+    assert.deepEqual(
+      extractThinking([
+        { type: "thinking", thinking: "first thought" },
+        { type: "text", text: "in between" },
+        { type: "thinking", thinking: "second thought" },
+      ]),
+      [
+        { type: "thinking", content: "first thought" },
+        { type: "thinking", content: "second thought" },
+      ],
+    );
+  });
+
+  it("never traces the signature attestation blob", () => {
+    const parts = extractThinking([
+      { type: "thinking", thinking: "reasoning", thinkingSignature: "ErUBCkYIBRgCKkBd0pd" },
+    ]);
+    assert.deepEqual(parts, [{ type: "thinking", content: "reasoning" }]);
+    assert.ok(!JSON.stringify(parts).includes("ErUBCkYIBRgCKkBd0pd"));
+  });
+
+  it("marks a redacted block and carries no withheld payload", () => {
+    assert.deepEqual(
+      extractThinking([
+        {
+          type: "thinking",
+          thinking: "[Reasoning redacted]",
+          thinkingSignature: "opaque-encrypted-payload",
+          redacted: true,
+        },
+      ]),
+      [{ type: "thinking", content: "[Reasoning redacted]", redacted: true }],
+    );
+  });
+
+  it("skips empty blocks, so a non-reasoning model traces as before", () => {
+    assert.deepEqual(extractThinking([{ type: "thinking", thinking: "" }]), []);
+    assert.deepEqual(extractThinking([{ type: "thinking", thinking: "\n  \t" }]), []);
+    assert.deepEqual(extractThinking([{ type: "text", text: "no reasoning here" }]), []);
+  });
+
+  it("survives malformed parts and non-arrays", () => {
+    assert.deepEqual(extractThinking(undefined), []);
+    assert.deepEqual(extractThinking("a string"), []);
+    assert.deepEqual(extractThinking([null, 42, { type: "thinking" }, { type: "thinking", thinking: 7 }]), []);
+  });
+
+  it("keeps a long reasoning block whole", () => {
+    const parts = extractThinking([{ type: "thinking", thinking: "z".repeat(120_000) }]);
+    assert.equal(parts[0]!.content.length, 120_000);
   });
 });

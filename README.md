@@ -20,6 +20,8 @@ Langfuse as its own trace:
   grouped under one session ID. Turn numbering survives a Pi restart.
 - **Model generations**: every model request with inputs, outputs, cost, time to
   first token, and token usage including cache-read and reasoning splits.
+- **Conversation history**: each generation has all messages of that call.
+- **Reasoning**: each thinking block is on the step that made it.
 - **Tool calls**: each tool Pi invokes, with input, output, and an `ERROR` level
   when the call fails.
 - **Images**: images you add to a prompt are uploaded as Langfuse media and

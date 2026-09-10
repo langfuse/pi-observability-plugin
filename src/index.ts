@@ -2,7 +2,12 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
+import {
+  type ExtensionAPI,
+  type ExtensionContext,
+  convertToLlm,
+  getAgentDir,
+} from "@earendil-works/pi-coding-agent";
 import { LangfuseSpanProcessor } from "@langfuse/otel";
 import {
   type LangfuseSpan,
@@ -282,6 +287,127 @@ export function toMultimodalContent(
   ];
 }
 
+type PiAgentMessages = Parameters<typeof convertToLlm>[0];
+
+export interface ChatMlToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments?: string };
+}
+
+export interface ChatMlThinkingPart {
+  type: "thinking";
+  content: string;
+  redacted?: true;
+}
+
+export type ChatMlMessage =
+  | { role: "user"; content: string }
+  | {
+      role: "assistant";
+      content?: string;
+      thinking?: ChatMlThinkingPart[];
+      tool_calls?: ChatMlToolCall[];
+    }
+  | { role: "tool"; tool_call_id: string; name: string; content: string; is_error?: true };
+
+export function markDataUris(text: string): string {
+  return text.replace(
+    /data:[^;,]{0,100};base64,[A-Za-z0-9+/]+=*/g,
+    (uri) => `[data uri ~${Math.floor((uri.length * 3) / 4 / 1024)}KB]`,
+  );
+}
+
+function renderHistoryContent(content: unknown): string {
+  return typeof content === "string" || Array.isArray(content)
+    ? renderContentWithImageMarkers(content)
+    : safeStringify(content);
+}
+
+function historyToolCalls(content: unknown): ChatMlToolCall[] {
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter(
+      (p): p is { type: string; id: string; name: string; arguments?: unknown } =>
+        !!p && typeof p === "object" && (p as { type?: string }).type === "toolCall",
+    )
+    .map((part) => {
+      const args = safeStringify(redactLangfuseKeys(part.arguments));
+      return {
+        id: part.id,
+        type: "function" as const,
+        function: {
+          name: part.name,
+          ...(args ? { arguments: markDataUris(args) } : {}),
+        },
+      };
+    });
+}
+
+export function extractThinking(content: unknown): ChatMlThinkingPart[] {
+  if (!Array.isArray(content)) return [];
+  const parts: ChatMlThinkingPart[] = [];
+  for (const raw of content) {
+    if (!raw || typeof raw !== "object") continue;
+    const part = raw as { type?: unknown; thinking?: unknown; redacted?: unknown };
+    if (part.type !== "thinking") continue;
+    if (typeof part.thinking !== "string" || !part.thinking.trim()) continue;
+    parts.push({
+      type: "thinking",
+      content: markDataUris(part.thinking),
+      ...(part.redacted ? { redacted: true as const } : {}),
+    });
+  }
+  return parts;
+}
+
+export function toChatMlMessage(message: unknown): ChatMlMessage | undefined {
+  if (!message || typeof message !== "object") return undefined;
+  const msg = message as {
+    role?: unknown;
+    content?: unknown;
+    toolCallId?: unknown;
+    toolName?: unknown;
+    isError?: unknown;
+  };
+  if (msg.role === "user") {
+    return { role: "user", content: markDataUris(renderHistoryContent(msg.content)) };
+  }
+  if (msg.role === "assistant") {
+    const content = markDataUris(extractText(msg.content));
+    const thinking = extractThinking(msg.content);
+    const toolCalls = historyToolCalls(msg.content);
+    if (!content && !thinking.length && !toolCalls.length) return undefined;
+    return {
+      role: "assistant",
+      ...(content ? { content } : {}),
+      ...(thinking.length ? { thinking } : {}),
+      ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+    };
+  }
+  if (msg.role === "toolResult") {
+    return {
+      role: "tool",
+      tool_call_id: typeof msg.toolCallId === "string" ? msg.toolCallId : "",
+      name: typeof msg.toolName === "string" ? msg.toolName : "",
+      content: markDataUris(renderHistoryContent(msg.content)),
+      ...(msg.isError ? { is_error: true as const } : {}),
+    };
+  }
+  return undefined;
+}
+
+export function buildHistoryInput(messages: PiAgentMessages): ChatMlMessage[] | undefined {
+  try {
+    const history = convertToLlm(messages)
+      .map((message) => toChatMlMessage(message))
+      .filter((message): message is ChatMlMessage => message !== undefined);
+    return history.length ? history : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface PiUsage {
   input: number;
   output: number;
@@ -447,6 +573,7 @@ export default function (pi: ExtensionAPI) {
   let sessionHadImages = false;
   let fallbackTurnCounter = 0;
   let lastPromptText = "";
+  let lastContextHistory: ChatMlMessage[] | undefined;
   let compactionStartedAt: Date | undefined;
   const inheritedParent = readInheritedParent();
   const inheritedParentEnv: Record<string, string | undefined> = {
@@ -595,6 +722,7 @@ export default function (pi: ExtensionAPI) {
     const { text: promptText, meta: userMeta } = truncateText(event.prompt);
     const userText = [promptText, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
     lastPromptText = userText;
+    lastContextHistory = undefined;
     const isSubagent = Boolean(inheritedParent);
     traceAttributes = {
       ...(isSubagent ? {} : { [LangfuseOtelSpanAttributes.TRACE_NAME]: TRACE_NAME }),
@@ -641,6 +769,11 @@ export default function (pi: ExtensionAPI) {
     debug("root created, turn", turnNumber);
   });
 
+  pi.on("context", (event) => {
+    lastContextHistory = buildHistoryInput(event.messages);
+    debug("context captured", lastContextHistory?.length ?? 0, "messages");
+  });
+
   pi.on("agent_start", (_event, ctx) => {
     if (!state) return;
     const systemPrompt = readSystemPrompt(ctx);
@@ -660,14 +793,19 @@ export default function (pi: ExtensionAPI) {
       gen.obs.end();
     }
     const index = ++state.generationCount;
-    const baseInput =
-      index === 1
+    const history = lastContextHistory;
+    const baseInput: unknown =
+      history ??
+      (index === 1
         ? { role: "user", content: lastPromptText }
         : state.pendingToolResults.length
           ? { role: "tool", tool_results: state.pendingToolResults }
-          : undefined;
+          : undefined);
     const generationInput = state.systemPrompt
-      ? [{ role: "system", content: state.systemPrompt }, ...(baseInput ? [baseInput] : [])]
+      ? [
+          { role: "system", content: state.systemPrompt },
+          ...(Array.isArray(baseInput) ? baseInput : baseInput ? [baseInput] : []),
+        ]
       : baseInput;
 
     const obs = state.root.startObservation(
@@ -677,6 +815,8 @@ export default function (pi: ExtensionAPI) {
         model: ctx.model?.id,
         metadata: {
           assistant_index: index - 1,
+          input_source: history ? "context" : "delta",
+          ...(history ? { history_message_count: history.length } : {}),
           ...(ctx.model ? { provider: ctx.model.provider } : {}),
         },
       },
