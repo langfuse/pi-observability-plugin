@@ -315,24 +315,36 @@ describe("integration: model parameters", () => {
     }
   });
 
-  it("records the sampling parameters a model config adds", async () => {
+  it("reports exactly the sampling parameters the request carried", async () => {
     const capture = await startCaptureServer();
+    const wired = await startMockProvider();
     try {
-      const sandbox = createSandbox(mock.port);
+      const sandbox = createSandbox(wired.port);
       const modelsPath = join(sandbox.agentDir, "models.json");
       const models = JSON.parse(readFileSync(modelsPath, "utf8"));
-      models.providers.mock.models[0].samplingParams = { temperature: 0.2, top_k: 40, stop: ["</done>"] };
+      const declared: Record<string, unknown> = { temperature: 0.2, top_k: 40, stop: ["</done>"] };
+      models.providers.mock.models[0].samplingParams = declared;
       writeFileSync(modelsPath, JSON.stringify(models));
       const result = await runPi(sandbox, "Explore this project and summarize it", { env: langfuseEnv(capture) });
       assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
       await waitForRequests(capture, 1);
 
+      const sent = wired.payloads();
       const params = generationParameters(capture.spans());
-      assert.equal(params.length, 3);
-      for (const p of params) {
-        assert.deepEqual(p, { max_tokens: 8192, temperature: 0.2, top_k: 40, stop: '["</done>"]' });
+      assert.equal(params.length, sent.length, "one generation per provider request");
+      const keys = Object.keys(declared);
+      for (const [i, p] of params.entries()) {
+        assert.equal(p?.max_tokens, 8192, `generation ${i + 1} must still carry the cap`);
+        assert.deepEqual(
+          keys.filter((k) => p?.[k] !== undefined),
+          keys.filter((k) => sent[i]?.[k] !== undefined),
+          `generation ${i + 1} must report exactly the declared parameters the wire carried`,
+        );
+        assert.equal(p?.temperature, sent[i]?.temperature, `generation ${i + 1} temperature`);
+        assert.equal(p?.top_k, sent[i]?.top_k, `generation ${i + 1} top_k`);
       }
     } finally {
+      wired.close();
       capture.close();
     }
   });
