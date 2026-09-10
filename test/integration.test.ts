@@ -55,8 +55,12 @@ function inputOf(span: CapturedSpan): TracedMessage[] {
   return Array.isArray(parsed) ? (parsed as TracedMessage[]) : [parsed as TracedMessage];
 }
 
+function historyOf(span: CapturedSpan): TracedMessage[] {
+  return inputOf(span).filter((m) => m.role !== "system");
+}
+
 function contentsOf(span: CapturedSpan): string[] {
-  return inputOf(span).map((m) => m.content ?? "");
+  return historyOf(span).map((m) => m.content ?? "");
 }
 
 function wireText(content: unknown): string {
@@ -339,7 +343,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
           "context",
           "a session-less subagent run still gets its history from the context",
         );
-        const history = inputOf(generation);
+        const history = historyOf(generation);
         assert.equal(history[0]!.role, "user");
         assert.match(String(history[0]!.content), /^Task: inspect the repository/);
         assert.ok(
@@ -463,7 +467,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       assert.equal(generations.length, 3);
 
       assert.deepEqual(
-        generations.map((g) => inputOf(g).length),
+        generations.map((g) => historyOf(g).length),
         [1, 3, 5],
       );
       for (const generation of generations) {
@@ -479,12 +483,12 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       );
 
       for (const generation of generations) {
-        const first = inputOf(generation)[0]!;
+        const first = historyOf(generation)[0]!;
         assert.equal(first.role, "user");
         assert.equal(first.content, "Explore this project and summarize it");
       }
 
-      const last = inputOf(generations[2]!);
+      const last = historyOf(generations[2]!);
       assert.deepEqual(last.map((m) => m.role), ["user", "assistant", "tool", "assistant", "tool"]);
       assert.deepEqual(
         last.filter((m) => m.role === "tool").map((m) => m.name),
@@ -525,7 +529,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
 
       for (const [index, generation] of generations.entries()) {
         assert.deepEqual(
-          normalizeTraced(inputOf(generation)),
+          normalizeTraced(historyOf(generation)),
           normalizeWire(sent[index]!),
           `generation ${index + 1} input must equal the provider request`,
         );
@@ -551,7 +555,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       );
       assert.equal(secondTurn.length, 3);
 
-      const first = inputOf(secondTurn[0]!);
+      const first = historyOf(secondTurn[0]!);
       assert.equal(first.length, 7, "turn 1 (5 messages) plus the new prompt and its first step");
       assert.equal(first[0]!.content, "First prompt", "turn 1's prompt must still be there");
       assert.deepEqual(
@@ -559,7 +563,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
         ["First prompt", "Second prompt"],
         "both turns appear, in order",
       );
-      assert.equal(inputOf(secondTurn[2]!).length, 11);
+      assert.equal(historyOf(secondTurn[2]!).length, 11);
       for (const generation of secondTurn) {
         assert.equal(generation.attrs["langfuse.observation.metadata.input_source"], "context");
       }
@@ -598,7 +602,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       const afterCompaction = byStart(
         findSpansByName(spans, "LLM Call").filter((s) => s.traceId === roots[1]!.traceId),
       );
-      const first = inputOf(afterCompaction[0]!);
+      const first = historyOf(afterCompaction[0]!);
       assert.equal(first[0]!.role, "user");
       assert.match(
         first[0]!.content ?? "",
@@ -634,7 +638,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       const secondTurn = byStart(
         findSpansByName(capture.spans(), "LLM Call").filter((s) => s.traceId === roots[1]!.traceId),
       );
-      const history = inputOf(secondTurn[0]!);
+      const history = historyOf(secondTurn[0]!);
 
       const reasoning = history.filter((m) => m.thinking);
       assert.equal(reasoning.length, 1, "only the step that reasoned carries a thinking block");

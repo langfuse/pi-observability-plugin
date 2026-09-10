@@ -13,7 +13,7 @@ import {
   truncateText,
   buildUsageDetails,
   buildHistoryInput,
-  clampForHistory,
+  markDataUris,
   extractThinking,
   toChatMlMessage,
   type ChatMlMessage,
@@ -435,22 +435,18 @@ describe("readInheritedParent", () => {
   });
 });
 
-describe("clampForHistory", () => {
-  it("leaves text below the budget untouched", () => {
-    assert.equal(clampForHistory("hello"), "hello");
+describe("markDataUris", () => {
+  it("leaves plain text untouched, however long", () => {
+    assert.equal(markDataUris("hello"), "hello");
+    const long = "x".repeat(120_000);
+    assert.equal(markDataUris(long), long);
   });
 
-  it("collapses a data URI to a size marker before any truncation", () => {
+  it("collapses a data URI to a size marker", () => {
     const uri = `data:image/png;base64,${"A".repeat(4000)}`;
-    const clamped = clampForHistory(`before ${uri} after`, 100);
-    assert.ok(!clamped.includes("AAAA"), "no base64 may survive into a history copy");
-    assert.match(clamped, /\[data uri ~2KB\]/);
-    assert.ok(clamped.startsWith("before "), "surrounding text is kept");
-  });
-
-  it("marks a truncation instead of cutting silently", () => {
-    const clamped = clampForHistory("x".repeat(50), 10);
-    assert.equal(clamped, `${"x".repeat(10)}\n[truncated, 50 chars total]`);
+    const marked = markDataUris(`before ${uri} after`);
+    assert.ok(!marked.includes("AAAA"), "no base64 may survive into a history copy");
+    assert.equal(marked, "before [data uri ~2KB] after");
   });
 });
 
@@ -641,12 +637,12 @@ describe("buildHistoryInput", () => {
     assert.equal(buildHistoryInput([{ role: "unknown" }] as never), undefined);
   });
 
-  it("clamps each message on its own rather than the history as a whole", () => {
+  it("does not add a length cap of its own to a history message", () => {
     const history = buildHistoryInput([
-      { role: "user", content: [{ type: "text", text: "y".repeat(30_000) }], timestamp: 1 },
+      { role: "user", content: [{ type: "text", text: "y".repeat(120_000) }], timestamp: 1 },
       { role: "user", content: [{ type: "text", text: "short" }], timestamp: 2 },
     ] as never) as ChatMlMessage[];
-    assert.match((history[0] as { content: string }).content, /\[truncated, 30000 chars total\]/);
+    assert.equal((history[0] as { content: string }).content.length, 120_000);
     assert.equal((history[1] as { content: string }).content, "short");
   });
 });
@@ -700,8 +696,8 @@ describe("extractThinking", () => {
     assert.deepEqual(extractThinking([null, 42, { type: "thinking" }, { type: "thinking", thinking: 7 }]), []);
   });
 
-  it("clamps a long reasoning block like any other history text", () => {
-    const parts = extractThinking([{ type: "thinking", thinking: "z".repeat(30_000) }]);
-    assert.match(parts[0]!.content, /\[truncated, 30000 chars total\]/);
+  it("keeps a long reasoning block whole", () => {
+    const parts = extractThinking([{ type: "thinking", thinking: "z".repeat(120_000) }]);
+    assert.equal(parts[0]!.content.length, 120_000);
   });
 });
