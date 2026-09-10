@@ -10,28 +10,9 @@ import {
   renderContentWithImageMarkers,
   extractToolCalls,
   toMultimodalContent,
-  truncateText,
   buildUsageDetails,
   type PiUsage,
 } from "../src/index.ts";
-
-describe("truncateText", () => {
-  it("keeps short text untouched and records the original length", () => {
-    const { text, meta } = truncateText("hello");
-    assert.equal(text, "hello");
-    assert.deepEqual(meta, { truncated: false, orig_len: 5 });
-  });
-
-  it("head-truncates long text and records kept_len + sha256 of the full text", () => {
-    const long = "x".repeat(30_000);
-    const { text, meta } = truncateText(long);
-    assert.equal(text.length, 20_000);
-    assert.equal(meta.truncated, true);
-    assert.equal(meta.orig_len, 30_000);
-    assert.equal(meta.kept_len, 20_000);
-    assert.match(meta.sha256 ?? "", /^[a-f0-9]{64}$/);
-  });
-});
 
 describe("createSecretRedactor", () => {
   it("redacts Langfuse key tokens in plain strings", () => {

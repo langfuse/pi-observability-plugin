@@ -1,5 +1,4 @@
 
-import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -26,7 +25,6 @@ const COMPACTION_OBSERVATION_NAME = "Compaction";
 const BRANCH_SUMMARY_OBSERVATION_NAME = "Branch Summary";
 const TOOL_USAGE_OBSERVATION_NAME = "Tool LLM Usage";
 const BASE_TAGS = ["pi"];
-const MAX_CHARS = Number(process.env.PI_LANGFUSE_MAX_CHARS ?? "20000");
 
 // A data: URI is only worth emitting if the processor swaps it for a media
 // reference; with uploads off it stays in the span as full base64.
@@ -135,28 +133,6 @@ function readConfigFile(): Partial<Record<keyof LangfuseConfig, unknown>> {
 // ---------------------------------------------------------------------------
 // Payload helpers
 // ---------------------------------------------------------------------------
-
-export interface TruncationMeta {
-  truncated: boolean;
-  orig_len: number;
-  kept_len?: number;
-  sha256?: string;
-}
-
-export function truncateText(text: string): { text: string; meta: TruncationMeta } {
-  if (text.length <= MAX_CHARS) {
-    return { text, meta: { truncated: false, orig_len: text.length } };
-  }
-  return {
-    text: text.slice(0, MAX_CHARS),
-    meta: {
-      truncated: true,
-      orig_len: text.length,
-      kept_len: MAX_CHARS,
-      sha256: createHash("sha256").update(text).digest("hex"),
-    },
-  };
-}
 
 const SECRET_REDACTION_MARK = "[redacted-langfuse-secret]";
 const CYCLE_MARK = "[circular-ref]";
@@ -535,15 +511,13 @@ export default function (pi: ExtensionAPI) {
   const finalizeRoot = (opts: { cancelled: boolean }) => {
     if (!state) return;
     closeDanglingObservations("interrupted");
-    const { text, meta } = truncateText(state.lastAssistantText ?? "");
     const media = EMIT_IMAGE_MEDIA ? state.turnImages : [];
     if (media.length) sessionHadImages = true;
     state.root.update({
       input: media.length ? { role: "user", content: toMultimodalContent(state.userText, media) } : undefined,
-      output: state.lastAssistantText ? { role: "assistant", content: text } : undefined,
+      output: state.lastAssistantText ? { role: "assistant", content: state.lastAssistantText } : undefined,
       level: state.sawError ? "ERROR" : undefined,
       metadata: {
-        assistant_text_meta: meta,
         ...(state.turnImages.length ? { image_count: state.turnImages.length } : {}),
         ...(opts.cancelled ? { cancelled: true } : {}),
       },
@@ -605,8 +579,7 @@ export default function (pi: ExtensionAPI) {
     const sessionId = ctx.sessionManager.getSessionId();
     const turnNumber = resolveTurnNumber(ctx, event.prompt);
     const promptImages = extractImages(event.images);
-    const { text: promptText, meta: userMeta } = truncateText(event.prompt);
-    const userText = [promptText, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
+    const userText = [event.prompt, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
     lastPromptText = userText;
     const isSubagent = Boolean(inheritedParent);
     traceAttributes = {
@@ -629,7 +602,6 @@ export default function (pi: ExtensionAPI) {
           session_id: sessionId,
           turn_number: turnNumber,
           cwd: ctx.cwd,
-          user_text_meta: userMeta,
           ...(gitBranch ? { git_branch: gitBranch } : {}),
           ...(ctx.model ? { model: ctx.model.id, provider: ctx.model.provider } : {}),
           ...(isSubagent
@@ -715,14 +687,13 @@ export default function (pi: ExtensionAPI) {
 
     const text = extractText(message.content);
     const tools = extractToolCalls(message.content);
-    const { text: outText, meta: outMeta } = truncateText(text);
     const isError = message.stopReason === "error" || message.stopReason === "aborted";
     if (message.stopReason === "error") state.sawError = true;
 
     gen.obs.update({
       output: {
         role: "assistant",
-        ...(outText ? { content: outText } : {}),
+        ...(text ? { content: text } : {}),
         ...(tools.length ? { tool_calls: tools } : {}),
       },
       model: message.responseModel || message.model,
@@ -735,7 +706,6 @@ export default function (pi: ExtensionAPI) {
           }
         : {}),
       metadata: {
-        assistant_text_meta: outMeta,
         tool_count: tools.length,
         ...(message.stopReason ? { stop_reason: message.stopReason } : {}),
         ...(message.responseId ? { response_id: message.responseId } : {}),
@@ -759,15 +729,11 @@ export default function (pi: ExtensionAPI) {
     const serializedArgs = safeStringify(redactedArgs);
     const hasDataUri = /data:[^;,]{0,100};base64,/.test(serializedArgs);
     let input: unknown = redactedArgs;
-    let argsMeta: TruncationMeta | undefined;
-    if (hasDataUri || serializedArgs.length > MAX_CHARS) {
-      const marked = serializedArgs.replace(
+    if (hasDataUri) {
+      input = serializedArgs.replace(
         /data:[^;,]{0,100};base64,[A-Za-z0-9+/]+=*/g,
         (uri) => `[data uri ~${Math.floor((uri.length * 3) / 4 / 1024)}KB]`,
       );
-      const t = truncateText(marked);
-      input = t.text;
-      argsMeta = t.meta;
     }
     const obs = state.root.startObservation(
       `${TOOL_PREFIX} ${event.toolName}`,
@@ -776,7 +742,6 @@ export default function (pi: ExtensionAPI) {
         metadata: {
           tool_name: event.toolName,
           tool_id: event.toolCallId,
-          ...(argsMeta ? { args_meta: argsMeta } : {}),
         },
       },
       { asType: "tool" },
@@ -793,7 +758,6 @@ export default function (pi: ExtensionAPI) {
     const result = event.result as { content?: unknown; usage?: PiUsage } | undefined;
     const images = extractImages(result?.content);
     const rawOutput = renderContentWithImageMarkers(result?.content) || safeStringify(result?.content);
-    const { text: outText, meta: outMeta } = truncateText(rawOutput);
     if (event.isError) state.sawError = true;
     state.turnImages.push(...images);
 
@@ -826,10 +790,9 @@ export default function (pi: ExtensionAPI) {
     }
 
     open.obs.update({
-      output: outText || undefined,
+      output: rawOutput || undefined,
       ...(event.isError ? { level: "ERROR" as const, statusMessage: "Tool execution failed" } : {}),
       metadata: {
-        output_meta: outMeta,
         is_error: Boolean(event.isError),
         ...(images.length ? { image_count: images.length } : {}),
       },
@@ -839,7 +802,7 @@ export default function (pi: ExtensionAPI) {
     state.pendingToolResults.push({
       tool_call_id: event.toolCallId,
       name: open.name,
-      content: outText.slice(0, 4000),
+      content: rawOutput,
     });
   });
 
@@ -907,7 +870,7 @@ export default function (pi: ExtensionAPI) {
       | { summary?: string; tokensBefore?: number; usage?: PiUsage; fromHook?: boolean }
       | undefined;
     const usage = entry?.usage;
-    const { text: summaryText, meta: summaryMeta } = truncateText(entry?.summary ?? "");
+    const summaryText = entry?.summary ?? "";
     emitSummarizationGeneration(
       COMPACTION_OBSERVATION_NAME,
       ctx,
@@ -924,7 +887,6 @@ export default function (pi: ExtensionAPI) {
           ...(entry?.fromHook ? { from_hook: true } : {}),
           ...(typeof entry?.tokensBefore === "number" ? { tokens_before: entry.tokensBefore } : {}),
           ...(ctx.model ? { provider: ctx.model.provider } : {}),
-          summary_meta: summaryMeta,
         },
       },
       startedAt,
@@ -941,7 +903,7 @@ export default function (pi: ExtensionAPI) {
       | undefined;
     if (!entry) return; // plain navigation without a summarization call
     const usage = entry.usage;
-    const { text: summaryText, meta: summaryMeta } = truncateText(entry.summary ?? "");
+    const summaryText = entry.summary ?? "";
     emitSummarizationGeneration(
       BRANCH_SUMMARY_OBSERVATION_NAME,
       ctx,
@@ -955,7 +917,6 @@ export default function (pi: ExtensionAPI) {
           ...(entry.fromHook ? { from_hook: true } : {}),
           ...(usage?.cacheWrite1h ? { cache_write_1h_tokens: usage.cacheWrite1h } : {}),
           ...(ctx.model ? { provider: ctx.model.provider } : {}),
-          summary_meta: summaryMeta,
         },
       },
     );
