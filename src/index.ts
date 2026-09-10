@@ -35,8 +35,6 @@ const EMIT_IMAGE_MEDIA = (() => {
   return raw ? !["false", "0"].includes(raw) : true;
 })();
 
-// pi subagents are child processes that get process.env from the parent. pi
-// itself has no trace propagation, so these variables connect the traces.
 const ENV_PARENT_TRACE_ID = "LANGFUSE_PI_PARENT_TRACE_ID";
 const ENV_PARENT_SPAN_ID = "LANGFUSE_PI_PARENT_SPAN_ID";
 const ENV_PARENT_SESSION_ID = "LANGFUSE_PI_PARENT_SESSION_ID";
@@ -111,13 +109,6 @@ export function loadConfig(): LangfuseConfig | undefined {
   };
 }
 
-/**
- * Persistent config lives at `<agentDir>/langfuse.json` (usually
- * `~/.pi/agent/langfuse.json`, keep it chmod 600) so plain `pi` in any project
- * is traced without exporting env vars. Environment variables override the
- * file for ad-hoc runs. Literal values only (no env interpolation, no
- * command execution — a config file must not be able to run code).
- */
 function readConfigFile(): Partial<Record<keyof LangfuseConfig, unknown>> {
   try {
     const path = join(getAgentDir(), "langfuse.json");
@@ -166,7 +157,6 @@ function escapeRegExpLiteral(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Redact Langfuse API keys and the given literal secrets from arbitrarily shaped payloads; cycles collapse to a marker so the result survives JSON serialization. */
 export function createSecretRedactor(...extraSecrets: string[]): (value: unknown) => unknown {
   const alternatives = extraSecrets.filter((s) => s.length > 0).map(escapeRegExpLiteral);
   alternatives.push(LANGFUSE_KEY_TOKEN);
@@ -183,8 +173,6 @@ export function createSecretRedactor(...extraSecrets: string[]): (value: unknown
     }
     const fields: Record<string, unknown> = {};
     for (const [key, field] of Object.entries(value)) {
-      // defineProperty, not assignment: a key literally named "__proto__"
-      // must stay a data key instead of mutating the clone's prototype.
       Object.defineProperty(fields, key, {
         value: walk(field, chain),
         enumerable: true,
@@ -199,7 +187,17 @@ export function createSecretRedactor(...extraSecrets: string[]): (value: unknown
 
 const redactLangfuseKeys = createSecretRedactor();
 
-/** Extract plain text from a pi message content array. */
+export function readSystemPrompt(ctx: { getSystemPrompt?: () => string | undefined }): string | undefined {
+  let raw: unknown;
+  try {
+    raw = ctx.getSystemPrompt?.();
+  } catch {
+    return undefined;
+  }
+  if (typeof raw !== "string" || !raw.trim()) return undefined;
+  return redactLangfuseKeys(raw) as string;
+}
+
 export function extractText(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -272,12 +270,6 @@ export function toDataUri(image: PiImagePart): string | undefined {
   return `data:${image.mimeType};base64,${data}`;
 }
 
-/**
- * Returns `text` unchanged when there are no images. With images it returns the
- * OpenAI-style content parts (the text, then one `image_url` per image) that the
- * Langfuse UI shows as a picture. Never truncate the result: a cut data URI is
- * uploaded as a corrupt file.
- */
 export function toMultimodalContent(
   text: string,
   images: readonly PiImagePart[] | undefined,
@@ -343,10 +335,6 @@ export function buildCostDetails(usage: PiUsage): Record<string, number> | undef
   const details: Record<string, number> = { total: cost.total };
   if (cost.input > 0) details.input = cost.input;
   if (cost.output > 0) {
-    // pi prices every output token of a call at one rate (its tier selection
-    // reads only input-side tokens), so the reasoning share is exactly
-    // proportional. Deriving the non-reasoning bucket by subtraction keeps the
-    // two buckets summing bit-for-bit to the total pi reported.
     const { reasoning, canSplit } = resolveReasoningSplit(usage);
     if (canSplit) {
       const reasoningCost = cost.output * (reasoning / usage.output);
@@ -432,6 +420,7 @@ interface PromptState {
   sawError: boolean;
   userText: string;
   turnImages: PiImagePart[];
+  systemPrompt?: string;
 }
 
 const DEBUG = process.env.PI_LANGFUSE_DEBUG === "true";
@@ -597,9 +586,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", (event, ctx) => {
     debug("before_agent_start");
     ensureRuntime();
-    debug("runtime ready");
-    // A previous prompt that never settled (e.g. rapid re-prompt) is closed
-    // rather than leaked.
+    debug("runtime ready"); 
     if (state) finalizeRoot({ cancelled: true });
 
     const sessionId = ctx.sessionManager.getSessionId();
@@ -654,22 +641,34 @@ export default function (pi: ExtensionAPI) {
     debug("root created, turn", turnNumber);
   });
 
+  pi.on("agent_start", (_event, ctx) => {
+    if (!state) return;
+    const systemPrompt = readSystemPrompt(ctx);
+    if (!systemPrompt) return;
+    state.systemPrompt = systemPrompt;
+    try {
+      state.root.update({ metadata: { system_prompt: systemPrompt } });
+    } catch {}
+    debug("system prompt captured", systemPrompt.length);
+  });
+
   pi.on("before_provider_request", (_event, ctx) => {
     if (!state) return;
-    // A new provider request while one is open means the previous HTTP
-    // attempt was retried/superseded — close it instead of leaking it.
     if (state.openGeneration && !state.openGeneration.finished) {
       const gen = state.openGeneration;
       gen.obs.update({ level: "WARNING", statusMessage: "Superseded by provider retry", metadata: { superseded: true } });
       gen.obs.end();
     }
     const index = ++state.generationCount;
-    const generationInput =
+    const baseInput =
       index === 1
         ? { role: "user", content: lastPromptText }
         : state.pendingToolResults.length
           ? { role: "tool", tool_results: state.pendingToolResults }
           : undefined;
+    const generationInput = state.systemPrompt
+      ? [{ role: "system", content: state.systemPrompt }, ...(baseInput ? [baseInput] : [])]
+      : baseInput;
 
     const obs = state.root.startObservation(
       GENERATION_PREFIX,
