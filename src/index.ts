@@ -13,6 +13,7 @@ import {
   startObservation,
 } from "@langfuse/tracing";
 import { type SpanContext, TraceFlags } from "@opentelemetry/api";
+import { defaultResource, detectResources, envDetector } from "@opentelemetry/resources";
 import { AlwaysOnSampler, NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 
 const EXTENSION_NAME = "@langfuse/pi-observability-plugin";
@@ -390,6 +391,7 @@ function createRuntime(
     span.setAttributes(resolveTraceAttributes());
   };
   const provider = new NodeTracerProvider({
+    resource: defaultResource().merge(detectResources({ detectors: [envDetector] })),
     spanProcessors: [processor],
     sampler: new AlwaysOnSampler(),
     spanLimits: { attributeValueLengthLimit: Infinity, attributeCountLimit: Infinity },

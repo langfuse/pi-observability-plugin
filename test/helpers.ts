@@ -192,6 +192,8 @@ export interface Capture {
   port: number;
   requests: unknown[];
   spans: () => CapturedSpan[];
+  /** Attributes of the OTLP resource the exported spans were sent under. */
+  resourceAttrs: () => Record<string, unknown>;
   close: () => void;
 }
 
@@ -250,6 +252,15 @@ export function startCaptureServer(): Promise<Capture> {
                   });
                 }
               }
+            }
+          }
+          return out;
+        },
+        resourceAttrs: () => {
+          const out: Record<string, unknown> = {};
+          for (const r of requests as Array<{ resourceSpans?: Array<{ resource?: { attributes?: Array<{ key: string; value: never }> } }> }>) {
+            for (const rs of r.resourceSpans ?? []) {
+              for (const a of rs.resource?.attributes ?? []) out[a.key] = parseAttrValue(a.value);
             }
           }
           return out;
@@ -372,6 +383,10 @@ export function runPi(
         LANGFUSE_TRACING_ENVIRONMENT: undefined,
         LANGFUSE_RELEASE: undefined,
         LANGFUSE_TRACING_ENABLED: undefined,
+        // These feed the exported OTel resource, so the runner's own
+        // environment must not reach the span payload either.
+        OTEL_SERVICE_NAME: undefined,
+        OTEL_RESOURCE_ATTRIBUTES: undefined,
         // A test run must not get a parent trace from this test process.
         LANGFUSE_PI_PARENT_TRACE_ID: undefined,
         LANGFUSE_PI_PARENT_SPAN_ID: undefined,

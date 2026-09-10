@@ -205,6 +205,50 @@ describe("integration: pi -> extension -> Langfuse export", () => {
     }
   });
 
+  it("exports OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES as resource attributes", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const result = await runPi(sandbox, "Explore this project and summarize it", {
+        env: {
+          ...buildLangfuseEnv(capture),
+          OTEL_SERVICE_NAME: "pi-agent",
+          OTEL_RESOURCE_ATTRIBUTES: "service.namespace=engineering,service.version=1.2.3,team.name=platform",
+        },
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+      await waitForRequests(capture, 1);
+      const resource = capture.resourceAttrs();
+
+      assert.equal(resource["service.name"], "pi-agent");
+      assert.equal(resource["service.namespace"], "engineering");
+      assert.equal(resource["service.version"], "1.2.3");
+      assert.equal(resource["team.name"], "platform");
+      // The default resource must survive the merge.
+      assert.equal(resource["telemetry.sdk.language"], "nodejs");
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("falls back to the default resource when the OTEL env vars are unset", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const result = await runPi(sandbox, "Explore this project and summarize it", {
+        env: buildLangfuseEnv(capture),
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+      await waitForRequests(capture, 1);
+      const resource = capture.resourceAttrs();
+
+      assert.match(String(resource["service.name"]), /^unknown_service:/);
+      assert.equal(resource["telemetry.sdk.name"], "opentelemetry");
+    } finally {
+      capture.close();
+    }
+  });
+
   it("nests a spawned subagent into the parent trace instead of orphaning it", async () => {
     const capture = await startCaptureServer();
     try {
