@@ -75,7 +75,13 @@ function streamChunks(
 /** Usage the mock reports for a compaction/branch summarization call. */
 export const SUMMARIZATION_USAGE = { prompt: 3571, completion: 313 };
 
-export function startMockProvider(): Promise<{ port: number; close: () => void }> {
+export function startMockProvider(): Promise<{
+  port: number;
+  close: () => void;
+  /** Request bodies the provider received, in call order. */
+  payloads: () => Array<Record<string, unknown>>;
+}> {
+  const received: Array<Record<string, unknown>> = [];
   const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -85,6 +91,7 @@ export function startMockProvider(): Promise<{ port: number; close: () => void }
         messages?: OpenAiMessage[];
         tools?: Array<{ function?: { name?: string } }>;
       };
+      received.push(payload as Record<string, unknown>);
       const messages = payload.messages ?? [];
       const model = payload.model ?? "mock-gpt-1";
       const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
@@ -169,7 +176,7 @@ export function startMockProvider(): Promise<{ port: number; close: () => void }
   return new Promise((resolvePromise) => {
     server.listen(0, "127.0.0.1", () => {
       const port = (server.address() as { port: number }).port;
-      resolvePromise({ port, close: () => server.close() });
+      resolvePromise({ port, close: () => server.close(), payloads: () => [...received] });
     });
   });
 }

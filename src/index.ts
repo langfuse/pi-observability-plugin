@@ -291,6 +291,14 @@ export function toMultimodalContent(
 }
 
 const MAX_TOKENS_KEYS = ["max_tokens", "max_completion_tokens", "max_output_tokens", "maxOutputTokens", "maxTokens"];
+const MAX_PARAM_CHARS = 200;
+const THINKING_BUDGET_KEYS = [
+  "thinking_token_budget",
+  "thinking_budget",
+  "thinking_budget_tokens",
+  "budget_tokens",
+  "thinkingBudget",
+];
 
 function findNumber(bag: unknown, keys: string[], depth = 2): number | undefined {
   if (!bag || typeof bag !== "object" || Array.isArray(bag)) return undefined;
@@ -307,9 +315,29 @@ function findNumber(bag: unknown, keys: string[], depth = 2): number | undefined
   return undefined;
 }
 
+function pickCacheRetention(payload: unknown): string | undefined {
+  const bag = payload as Record<string, unknown> | undefined;
+  const flat = bag?.prompt_cache_retention;
+  if (typeof flat === "string") return flat;
+  const system = bag?.system;
+  if (!Array.isArray(system)) return undefined;
+  for (const block of system) {
+    const ttl = (block as { cache_control?: { ttl?: unknown } } | undefined)?.cache_control?.ttl;
+    if (typeof ttl === "string") return ttl;
+  }
+  return undefined;
+}
+
+function pickToolChoice(payload: unknown): string | undefined {
+  const value = (payload as Record<string, unknown> | undefined)?.tool_choice;
+  if (typeof value === "string") return value;
+  const type = (value as { type?: unknown } | undefined)?.type;
+  return typeof type === "string" ? type : undefined;
+}
+
 export function extractModelParameters(
   payload: unknown,
-  model: { reasoning?: boolean } | undefined,
+  model: { reasoning?: boolean; samplingParams?: Record<string, unknown> } | undefined,
   thinkingLevel?: string,
 ): Record<string, string | number> | undefined {
   const out: Record<string, string | number> = {};
@@ -317,6 +345,23 @@ export function extractModelParameters(
     const maxTokens = findNumber(payload, MAX_TOKENS_KEYS);
     if (maxTokens !== undefined) out.max_tokens = maxTokens;
     if (model?.reasoning && thinkingLevel && thinkingLevel !== "off") out.thinking_level = thinkingLevel;
+    const thinkingBudget = findNumber(payload, THINKING_BUDGET_KEYS);
+    if (thinkingBudget !== undefined) out.thinking_budget_tokens = thinkingBudget;
+    const cacheRetention = pickCacheRetention(payload);
+    if (cacheRetention !== undefined) out.prompt_cache_retention = cacheRetention;
+    const serviceTier = (payload as Record<string, unknown> | undefined)?.service_tier;
+    if (typeof serviceTier === "string") out.service_tier = serviceTier;
+    const toolChoice = pickToolChoice(payload);
+    if (toolChoice !== undefined) out.tool_choice = toolChoice;
+    for (const key of Object.keys(model?.samplingParams ?? {})) {
+      const value = (payload as Record<string, unknown> | undefined)?.[key];
+      if (value === undefined) continue;
+      if (typeof value === "number") out[key] = value;
+      else {
+        const text = typeof value === "string" ? value : JSON.stringify(value);
+        if (text !== undefined && text.length <= MAX_PARAM_CHARS) out[key] = text;
+      }
+    }
   } catch {}
   return Object.keys(out).length ? out : undefined;
 }
@@ -710,7 +755,7 @@ export default function (pi: ExtensionAPI) {
         modelParameters: extractModelParameters(event.payload, ctx.model, ctx.thinkingLevel),
         metadata: {
           assistant_index: index - 1,
-          ...(ctx.model ? { provider: ctx.model.provider } : {}),
+          ...(ctx.model ? { provider: ctx.model.provider, context_window: ctx.model.contextWindow } : {}),
         },
       },
       { asType: "generation" },
