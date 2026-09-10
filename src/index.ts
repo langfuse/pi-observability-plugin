@@ -199,6 +199,17 @@ export function createSecretRedactor(...extraSecrets: string[]): (value: unknown
 
 const redactLangfuseKeys = createSecretRedactor();
 
+export function readSystemPrompt(ctx: { getSystemPrompt?: () => string | undefined }): string | undefined {
+  let raw: unknown;
+  try {
+    raw = ctx.getSystemPrompt?.();
+  } catch {
+    return undefined;
+  }
+  if (typeof raw !== "string" || !raw.trim()) return undefined;
+  return redactLangfuseKeys(raw) as string;
+}
+
 /** Extract plain text from a pi message content array. */
 export function extractText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -432,6 +443,7 @@ interface PromptState {
   sawError: boolean;
   userText: string;
   turnImages: PiImagePart[];
+  systemPrompt?: string;
 }
 
 const DEBUG = process.env.PI_LANGFUSE_DEBUG === "true";
@@ -654,6 +666,17 @@ export default function (pi: ExtensionAPI) {
     debug("root created, turn", turnNumber);
   });
 
+  pi.on("agent_start", (_event, ctx) => {
+    if (!state) return;
+    const systemPrompt = readSystemPrompt(ctx);
+    if (!systemPrompt) return;
+    state.systemPrompt = systemPrompt;
+    try {
+      state.root.update({ metadata: { system_prompt: systemPrompt } });
+    } catch {}
+    debug("system prompt captured", systemPrompt.length);
+  });
+
   pi.on("before_provider_request", (_event, ctx) => {
     if (!state) return;
     // A new provider request while one is open means the previous HTTP
@@ -664,12 +687,15 @@ export default function (pi: ExtensionAPI) {
       gen.obs.end();
     }
     const index = ++state.generationCount;
-    const generationInput =
+    const baseInput =
       index === 1
         ? { role: "user", content: lastPromptText }
         : state.pendingToolResults.length
           ? { role: "tool", tool_results: state.pendingToolResults }
           : undefined;
+    const generationInput = state.systemPrompt
+      ? [{ role: "system", content: state.systemPrompt }, ...(baseInput ? [baseInput] : [])]
+      : baseInput;
 
     const obs = state.root.startObservation(
       GENERATION_PREFIX,
