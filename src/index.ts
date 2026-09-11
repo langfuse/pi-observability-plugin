@@ -214,6 +214,37 @@ export function extractToolCalls(content: unknown): Array<{ id: string; name: st
     .map((p) => ({ id: p.id, name: p.name }));
 }
 
+export interface ToolDefinitionInput {
+  name: string;
+  description?: string;
+  parameters?: unknown;
+}
+
+export function activeToolDefinitions(
+  pi: Pick<ExtensionAPI, "getAllTools" | "getActiveTools">,
+): ToolDefinitionInput[] {
+  try {
+    const registry = new Map((pi.getAllTools?.() ?? []).map((tool) => [tool.name, tool]));
+    const out: ToolDefinitionInput[] = [];
+    const seen = new Set<string>();
+    for (const name of pi.getActiveTools?.() ?? []) {
+      const tool = registry.get(name);
+      if (!tool || seen.has(name)) continue;
+      seen.add(name);
+      out.push({ name: tool.name, description: tool.description, parameters: tool.parameters });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+export function attachToolDefinitions(input: unknown, tools: ToolDefinitionInput[]): unknown {
+  if (!tools.length || !Array.isArray(input)) return input;
+  const [first, ...rest] = input;
+  return first && typeof first === "object" ? [{ ...first, tools }, ...rest] : input;
+}
+
 export interface PiImagePart {
   type: "image";
   data: string;
@@ -662,18 +693,20 @@ export default function (pi: ExtensionAPI) {
     const index = ++state.generationCount;
     const baseInput =
       index === 1
-        ? { role: "user", content: lastPromptText }
+        ? [{ role: "user", content: lastPromptText }]
         : state.pendingToolResults.length
-          ? { role: "tool", tool_results: state.pendingToolResults }
-          : undefined;
+          ? [{ role: "tool", tool_results: state.pendingToolResults }]
+          : [];
     const generationInput = state.systemPrompt
-      ? [{ role: "system", content: state.systemPrompt }, ...(baseInput ? [baseInput] : [])]
-      : baseInput;
+      ? [{ role: "system", content: state.systemPrompt }, ...baseInput]
+      : baseInput.length
+        ? baseInput
+        : undefined;
 
     const obs = state.root.startObservation(
       GENERATION_PREFIX,
       {
-        input: generationInput,
+        input: attachToolDefinitions(generationInput, activeToolDefinitions(pi)),
         model: ctx.model?.id,
         metadata: {
           assistant_index: index - 1,
