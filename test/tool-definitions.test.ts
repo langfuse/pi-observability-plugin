@@ -25,9 +25,11 @@ describe("attachToolDefinitions", () => {
   });
 
   it("passes the input through when there is nothing to attach or nothing to attach to", () => {
-    const message = [{ role: "user", content: "hi" }];
-    assert.equal(attachToolDefinitions(message, []), message);
+    const messages = [{ role: "user", content: "hi" }];
+    assert.equal(attachToolDefinitions(messages, []), messages);
     assert.equal(attachToolDefinitions(undefined, TOOLS), undefined);
+    const bare = { role: "user", content: "hi" };
+    assert.equal(attachToolDefinitions(bare, TOOLS), bare);
   });
 });
 

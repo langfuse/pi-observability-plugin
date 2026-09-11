@@ -240,12 +240,9 @@ export function activeToolDefinitions(
 }
 
 export function attachToolDefinitions(input: unknown, tools: ToolDefinitionInput[]): unknown {
-  if (!tools.length || !input || typeof input !== "object") return input;
-  if (Array.isArray(input)) {
-    const [first, ...rest] = input;
-    return first && typeof first === "object" ? [{ ...first, tools }, ...rest] : input;
-  }
-  return { ...input, tools };
+  if (!tools.length || !Array.isArray(input)) return input;
+  const [first, ...rest] = input;
+  return first && typeof first === "object" ? [{ ...first, tools }, ...rest] : input;
 }
 
 export interface PiImagePart {
