@@ -14,6 +14,8 @@ import {
 } from "@langfuse/tracing";
 import { type SpanContext, TraceFlags } from "@opentelemetry/api";
 import { AlwaysOnSampler, NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import { captureProviderPayload, contextRegistry, maskTelemetry, memoryBlockHashes, type ParentEnvelope } from "./telemetry.ts";
+export { captureProviderPayload } from "./telemetry.ts";
 
 const EXTENSION_NAME = "@langfuse/pi-observability-plugin";
 const EXTENSION_VERSION = "0.1.2";
@@ -35,6 +37,8 @@ const EMIT_IMAGE_MEDIA = (() => {
   return raw ? !["false", "0"].includes(raw) : true;
 })();
 
+// pi subagents are child processes that get process.env from the parent. pi
+// itself has no trace propagation, so these variables connect the traces.
 const ENV_PARENT_TRACE_ID = "LANGFUSE_PI_PARENT_TRACE_ID";
 const ENV_PARENT_SPAN_ID = "LANGFUSE_PI_PARENT_SPAN_ID";
 const ENV_PARENT_SESSION_ID = "LANGFUSE_PI_PARENT_SESSION_ID";
@@ -109,6 +113,13 @@ export function loadConfig(): LangfuseConfig | undefined {
   };
 }
 
+/**
+ * Persistent config lives at `<agentDir>/langfuse.json` (usually
+ * `~/.pi/agent/langfuse.json`, keep it chmod 600) so plain `pi` in any project
+ * is traced without exporting env vars. Environment variables override the
+ * file for ad-hoc runs. Literal values only (no env interpolation, no
+ * command execution — a config file must not be able to run code).
+ */
 function readConfigFile(): Partial<Record<keyof LangfuseConfig, unknown>> {
   try {
     const path = join(getAgentDir(), "langfuse.json");
@@ -152,27 +163,32 @@ export function truncateText(text: string): { text: string; meta: TruncationMeta
 const SECRET_REDACTION_MARK = "[redacted-langfuse-secret]";
 const CYCLE_MARK = "[circular-ref]";
 const LANGFUSE_KEY_TOKEN = String.raw`\b[sp]k-lf-[\w-]+\b`;
+type TelemetryValue = boolean | number | string | null | undefined | TelemetryValue[] | { [key: string]: TelemetryValue };
 
 function escapeRegExpLiteral(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export function createSecretRedactor(...extraSecrets: string[]): (value: unknown) => unknown {
+/** Redact Langfuse API keys and the given literal secrets from arbitrarily shaped payloads; cycles collapse to a marker so the result survives JSON serialization. */
+export function createSecretRedactor(...extraSecrets: string[]): (value: unknown) => TelemetryValue {
   const alternatives = extraSecrets.filter((s) => s.length > 0).map(escapeRegExpLiteral);
   alternatives.push(LANGFUSE_KEY_TOKEN);
   const pattern = new RegExp(alternatives.join("|"), "g");
-  const walk = (value: unknown, ancestors: readonly object[]): unknown => {
+  const walk = (value: unknown, ancestors: readonly object[]): TelemetryValue => {
     if (typeof value === "string") return value.replace(pattern, SECRET_REDACTION_MARK);
-    if (value === null || typeof value !== "object") return value;
+    if (value === null || typeof value === "boolean" || typeof value === "number") return value;
+    if (typeof value !== "object") return undefined;
     if (ancestors.includes(value)) return CYCLE_MARK;
     const chain = [...ancestors, value];
     if (Array.isArray(value)) {
-      const items: unknown[] = [];
+      const items: TelemetryValue[] = [];
       for (const item of value) items.push(walk(item, chain));
       return items;
     }
-    const fields: Record<string, unknown> = {};
+    const fields: { [key: string]: TelemetryValue } = {};
     for (const [key, field] of Object.entries(value)) {
+      // defineProperty, not assignment: a key literally named "__proto__"
+      // must stay a data key instead of mutating the clone's prototype.
       Object.defineProperty(fields, key, {
         value: walk(field, chain),
         enumerable: true,
@@ -188,16 +204,15 @@ export function createSecretRedactor(...extraSecrets: string[]): (value: unknown
 const redactLangfuseKeys = createSecretRedactor();
 
 export function readSystemPrompt(ctx: { getSystemPrompt?: () => string | undefined }): string | undefined {
-  let raw: unknown;
   try {
-    raw = ctx.getSystemPrompt?.();
+    const prompt = ctx.getSystemPrompt?.();
+    return typeof prompt === "string" && prompt.trim() ? redactLangfuseKeys(prompt) as string : undefined;
   } catch {
     return undefined;
   }
-  if (typeof raw !== "string" || !raw.trim()) return undefined;
-  return redactLangfuseKeys(raw) as string;
 }
 
+/** Extract plain text from a pi message content array. */
 export function extractText(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -270,6 +285,12 @@ export function toDataUri(image: PiImagePart): string | undefined {
   return `data:${image.mimeType};base64,${data}`;
 }
 
+/**
+ * Returns `text` unchanged when there are no images. With images it returns the
+ * OpenAI-style content parts (the text, then one `image_url` per image) that the
+ * Langfuse UI shows as a picture. Never truncate the result: a cut data URI is
+ * uploaded as a corrupt file.
+ */
 export function toMultimodalContent(
   text: string,
   images: readonly PiImagePart[] | undefined,
@@ -335,6 +356,10 @@ export function buildCostDetails(usage: PiUsage): Record<string, number> | undef
   const details: Record<string, number> = { total: cost.total };
   if (cost.input > 0) details.input = cost.input;
   if (cost.output > 0) {
+    // pi prices every output token of a call at one rate (its tier selection
+    // reads only input-side tokens), so the reasoning share is exactly
+    // proportional. Deriving the non-reasoning bucket by subtraction keeps the
+    // two buckets summing bit-for-bit to the total pi reported.
     const { reasoning, canSplit } = resolveReasoningSplit(usage);
     if (canSplit) {
       const reasoningCost = cost.output * (reasoning / usage.output);
@@ -378,7 +403,7 @@ function createRuntime(
     baseUrl: config.baseUrl,
     environment: config.environment,
     release: config.release,
-    mask: ({ data }) => redactSecrets(data),
+    mask: ({ data }) => maskTelemetry(redactSecrets(data)),
     shouldExportSpan: ({ otelSpan }) => isLangfuseSpan(otelSpan),
   });
   // Trace fields are stamped here rather than on the root span: Langfuse reads
@@ -420,7 +445,10 @@ interface PromptState {
   sawError: boolean;
   userText: string;
   turnImages: PiImagePart[];
+  sessionId: string;
   systemPrompt?: string;
+  memoryInjection?: Record<string, unknown>;
+  memoryRetrievals: Array<{ retrievalId: string; observationId: string }>;
 }
 
 const DEBUG = process.env.PI_LANGFUSE_DEBUG === "true";
@@ -446,9 +474,12 @@ export default function (pi: ExtensionAPI) {
   let gitBranch: string | undefined;
   let sessionHadImages = false;
   let fallbackTurnCounter = 0;
-  let lastPromptText = "";
   let compactionStartedAt: Date | undefined;
-  const inheritedParent = readInheritedParent();
+  const environmentParent = readInheritedParent();
+  let inheritedParent = environmentParent;
+  let explicitParent: ParentEnvelope | undefined;
+  let isChildSession = Boolean(environmentParent);
+  let lastContext: ExtensionContext | undefined;
   const inheritedParentEnv: Record<string, string | undefined> = {
     [ENV_PARENT_TRACE_ID]: process.env[ENV_PARENT_TRACE_ID],
     [ENV_PARENT_SPAN_ID]: process.env[ENV_PARENT_SPAN_ID],
@@ -458,7 +489,15 @@ export default function (pi: ExtensionAPI) {
 
   const ensureRuntime = (): Runtime => {
     if (!runtime || runtime.shutdown) runtime = createRuntime(config, () => traceAttributes);
+    // In-process children share the Langfuse SDK's provider pointer.
+    setLangfuseTracerProvider(runtime.provider);
     return runtime;
+  };
+
+  const readExplicitParent = (): ParentEnvelope | undefined => {
+    let parent: ParentEnvelope | undefined;
+    pi.events.emit("pi:trace-parent-request", { reply: (value: ParentEnvelope) => { parent = value; } });
+    return parent;
   };
 
   const resolveTurnNumber = (ctx: ExtensionContext, promptText: string): number => {
@@ -506,6 +545,21 @@ export default function (pi: ExtensionAPI) {
     // Do not publish a root that the sampler dropped. Child spans would point
     // to a trace with no exported root.
     if (!(ctx.traceFlags & TraceFlags.SAMPLED)) return;
+    contextRegistry().set(sessionId, Object.freeze({
+      traceId: ctx.traceId, spanId: ctx.spanId,
+      rootSessionId: inheritedParent?.sessionId ?? sessionId,
+      parentSessionId: explicitParent?.parentSessionId,
+      depth: inheritedParent?.depth ?? 0,
+    }));
+    if (isChildSession) {
+      const parent = explicitParent?.parentSessionId ? contextRegistry().get(explicitParent.parentSessionId) : undefined;
+      if (parent && explicitParent && parent.spanId === explicitParent.spanId && explicitParent.runId && explicitParent.childIndex !== undefined) {
+        contextRegistry().set(explicitParent.parentSessionId!, Object.freeze({...parent,
+          tracedChildren: [...new Set([...(parent.tracedChildren ?? []), `${explicitParent.runId}:${explicitParent.childIndex}`])],
+        }));
+      }
+      return;
+    }
     process.env[ENV_PARENT_TRACE_ID] = ctx.traceId;
     process.env[ENV_PARENT_SPAN_ID] = ctx.spanId;
     process.env[ENV_PARENT_SESSION_ID] = sessionId;
@@ -515,6 +569,10 @@ export default function (pi: ExtensionAPI) {
   // A child must not attach to a turn that has ended. The inherited values
   // stay valid, so put them back instead of a plain delete.
   const withdrawParentContext = () => {
+    if (state && contextRegistry().get(state.sessionId)?.spanId === state.root.otelSpan.spanContext().spanId) {
+      contextRegistry().delete(state.sessionId);
+    }
+    if (isChildSession) return;
     for (const [key, value] of Object.entries(inheritedParentEnv)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
@@ -573,6 +631,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.on("session_start", async (_event, ctx) => {
+    lastContext = ctx;
     debug("session_start");
     if (ctx.hasUI) ctx.ui.setStatus("langfuse", "langfuse ✓");
     try {
@@ -583,23 +642,35 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("before_agent_start", (event, ctx) => {
+  const beginPrompt = (event: { prompt: string; images?: unknown }, ctx: ExtensionContext, trigger: string) => {
+    lastContext = ctx;
     debug("before_agent_start");
     ensureRuntime();
-    debug("runtime ready"); 
+    debug("runtime ready");
+    // A previous prompt that never settled (e.g. rapid re-prompt) is closed
+    // rather than leaked.
     if (state) finalizeRoot({ cancelled: true });
+
+    explicitParent = readExplicitParent();
+    // Missing explicit IDs mean orphan, not permission to borrow sibling env.
+    inheritedParent = explicitParent ? readInheritedParent({
+      [ENV_PARENT_TRACE_ID]: explicitParent.traceId,
+      [ENV_PARENT_SPAN_ID]: explicitParent.spanId,
+      [ENV_PARENT_SESSION_ID]: explicitParent.rootSessionId ?? explicitParent.parentSessionId,
+      [ENV_PARENT_DEPTH]: String(explicitParent.depth ?? 1),
+    }) : environmentParent;
+    isChildSession = Boolean(explicitParent || inheritedParent);
 
     const sessionId = ctx.sessionManager.getSessionId();
     const turnNumber = resolveTurnNumber(ctx, event.prompt);
     const promptImages = extractImages(event.images);
     const { text: promptText, meta: userMeta } = truncateText(event.prompt);
     const userText = [promptText, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
-    lastPromptText = userText;
-    const isSubagent = Boolean(inheritedParent);
+    const isSubagent = isChildSession;
     traceAttributes = {
       ...(isSubagent ? {} : { [LangfuseOtelSpanAttributes.TRACE_NAME]: TRACE_NAME }),
       [LangfuseOtelSpanAttributes.TRACE_SESSION_ID]: isSubagent
-        ? (inheritedParent!.sessionId ?? sessionId)
+        ? (inheritedParent?.sessionId ?? explicitParent?.rootSessionId ?? sessionId)
         : sessionId,
       [LangfuseOtelSpanAttributes.TRACE_TAGS]: BASE_TAGS,
       ...(config.userId ? { [LangfuseOtelSpanAttributes.TRACE_USER_ID]: config.userId } : {}),
@@ -615,12 +686,20 @@ export default function (pi: ExtensionAPI) {
           extension_version: EXTENSION_VERSION,
           session_id: sessionId,
           turn_number: turnNumber,
+          trigger,
+          parent_link_source: explicitParent ? (inheritedParent ? "explicit" : "unavailable") : inheritedParent ? "environment" : "none",
           cwd: ctx.cwd,
           user_text_meta: userMeta,
           ...(gitBranch ? { git_branch: gitBranch } : {}),
           ...(ctx.model ? { model: ctx.model.id, provider: ctx.model.provider } : {}),
           ...(isSubagent
-            ? { pi_subagent: true, subagent_depth: inheritedParent!.depth, parent_session_id: inheritedParent!.sessionId }
+            ? { pi_subagent: true, subagent_depth: explicitParent?.depth ?? inheritedParent?.depth,
+                parent_session_id: explicitParent?.parentSessionId ?? inheritedParent?.sessionId,
+                root_session_id: inheritedParent?.sessionId ?? explicitParent?.rootSessionId,
+                parent_trace_id: inheritedParent?.spanContext.traceId,
+                parent_observation_id: inheritedParent?.spanContext.spanId,
+                run_id: explicitParent?.runId, agent: explicitParent?.agent, child_index: explicitParent?.childIndex,
+                parent_tool_call_id: explicitParent?.parentToolCallId, source_run_id: explicitParent?.sourceRunId }
             : {}),
         },
       },
@@ -636,47 +715,88 @@ export default function (pi: ExtensionAPI) {
       sawError: false,
       userText,
       turnImages: [...promptImages],
+      sessionId,
+      memoryRetrievals: [],
     };
     publishParentContext(root, sessionId);
     debug("root created, turn", turnNumber);
-  });
+  };
 
+  pi.on("before_agent_start", (event, ctx) => beginPrompt(event, ctx, "before_agent_start"));
   pi.on("agent_start", (_event, ctx) => {
-    if (!state) return;
+    lastContext = ctx;
+    if (!state) {
+      const latest = [...ctx.sessionManager.getBranch()].reverse().find(entry => entry.type === "message");
+      beginPrompt({ prompt: latest?.type === "message" ? extractText((latest.message as {content?: unknown}).content) : "" }, ctx, "agent_start");
+    }
     const systemPrompt = readSystemPrompt(ctx);
-    if (!systemPrompt) return;
+    if (!state || !systemPrompt) return;
     state.systemPrompt = systemPrompt;
-    try {
-      state.root.update({ metadata: { system_prompt: systemPrompt } });
-    } catch {}
-    debug("system prompt captured", systemPrompt.length);
+    try { state.root.update({ metadata: { system_prompt: systemPrompt } }); } catch { /* tracing is best effort */ }
   });
 
-  pi.on("before_provider_request", (_event, ctx) => {
+  pi.events.on("hindsight:retrieval", (raw: unknown) => {
+    // Telemetry is optional: observer failures must not alter recall behavior.
+    try {
+      if (!raw || typeof raw !== "object" || !lastContext) return;
+      const event = raw as Record<string, unknown>;
+      if (event.version !== 1 || !["retrieval", "injection"].includes(String(event.phase))) return;
+      if (event.sessionId && event.sessionId !== lastContext.sessionManager.getSessionId()) return;
+      const standalone = !state;
+      if (!state) beginPrompt({prompt:""}, lastContext, "memory-event");
+      if (!state) return;
+      ensureRuntime();
+      const { results, query, ...details } = event;
+      const date = new Date(String(event.startedAt));
+      const filters = event.filters && typeof event.filters === "object" ? event.filters as Record<string, unknown> : {};
+      const attributes = {
+          input: event.phase === "retrieval" ? {query, bank_id:event.bankId, tag_groups:event.tagGroups, filters:event.filters, budget:event.budget ?? filters.budget, max_tokens:event.maxTokens ?? filters.maxTokens} : undefined,
+          output: event.phase === "retrieval" ? {results, kept_ids:event.keptIds, injected_ids:event.injectedIds} : {injected:event.injected, rendered_hash:event.renderedHash, rendered_length:event.renderedLength},
+          level: event.status === "error" || event.status === "timeout" ? "WARNING" as const : "DEFAULT" as const,
+          statusMessage: typeof event.error === "string" ? event.error : undefined,
+          metadata: {...details, bank_id:event.bankId, retrieval_id:event.retrievalId, context_id:event.contextId},
+      };
+      const timing = Number.isFinite(date.getTime()) ? {startTime:date} : {};
+      const observation = event.phase === "retrieval"
+        ? state.root.startObservation("Hindsight Recall", attributes, {asType:"retriever", ...timing})
+        : state.root.startObservation("Hindsight Context Injection", attributes, {asType:"event", ...timing});
+      observation.end();
+      if (event.phase === "retrieval" && typeof event.retrievalId === "string") state.memoryRetrievals.push({retrievalId:event.retrievalId, observationId:observation.otelSpan.spanContext().spanId});
+      if (event.phase === "injection") state.memoryInjection = event;
+      if (standalone) { finalizeRoot({cancelled:false}); void flush(); }
+    } catch { /* Tracing must never break the session. */ }
+  });
+
+  pi.on("before_provider_request", (event, ctx) => {
+    if (!state) beginPrompt({ prompt: "" }, ctx, "provider-fallback");
     if (!state) return;
+    ensureRuntime();
+    // A new provider request while one is open means the previous HTTP
+    // attempt was retried/superseded — close it instead of leaking it.
     if (state.openGeneration && !state.openGeneration.finished) {
       const gen = state.openGeneration;
       gen.obs.update({ level: "WARNING", statusMessage: "Superseded by provider retry", metadata: { superseded: true } });
       gen.obs.end();
     }
     const index = ++state.generationCount;
-    const baseInput =
-      index === 1
-        ? { role: "user", content: lastPromptText }
-        : state.pendingToolResults.length
-          ? { role: "tool", tool_results: state.pendingToolResults }
-          : undefined;
-    const generationInput = state.systemPrompt
-      ? [{ role: "system", content: state.systemPrompt }, ...(baseInput ? [baseInput] : [])]
-      : baseInput;
+    const assembled = captureProviderPayload(event.payload);
+    const memoryHashes = memoryBlockHashes(event.payload);
 
     const obs = state.root.startObservation(
       GENERATION_PREFIX,
       {
-        input: generationInput,
+        input: assembled.input,
         model: ctx.model?.id,
         metadata: {
           assistant_index: index - 1,
+          assembled_context: assembled.meta,
+          memory_block_hashes: memoryHashes,
+          memory_context_id: state.memoryInjection?.contextId,
+          memory_retrieval_ids: state.memoryInjection?.retrievalIds,
+          memory_retrieval_observation_ids: state.memoryRetrievals.filter(item =>
+            (state?.memoryInjection?.retrievalIds as string[] | undefined)?.includes(item.retrievalId)).map(item => item.observationId),
+          memory_injection_verified: state.memoryInjection?.injected === true
+            ? memoryHashes.includes(String(state.memoryInjection.renderedHash)) : undefined,
           ...(ctx.model ? { provider: ctx.model.provider } : {}),
         },
       },
@@ -754,6 +874,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_execution_start", (event) => {
     if (!state) return;
+    ensureRuntime();
     const redactedArgs = redactLangfuseKeys(event.args) as Record<string, unknown>;
     const serializedArgs = safeStringify(redactedArgs);
     const hasDataUri = /data:[^;,]{0,100};base64,/.test(serializedArgs);
@@ -789,14 +910,20 @@ export default function (pi: ExtensionAPI) {
     if (!open) return;
     state.openTools.delete(event.toolCallId);
 
-    const result = event.result as { content?: unknown; usage?: PiUsage } | undefined;
+    const result = event.result as { content?: unknown; usage?: PiUsage; details?: {runId?: string; results?: Array<{index?: number}>} } | undefined;
     const images = extractImages(result?.content);
     const rawOutput = renderContentWithImageMarkers(result?.content) || safeStringify(result?.content);
     const { text: outText, meta: outMeta } = truncateText(rawOutput);
     if (event.isError) state.sawError = true;
     state.turnImages.push(...images);
 
-    if (result?.usage) {
+    const childResults = result?.details?.results;
+    const tracedChildren = contextRegistry().get(state.sessionId)?.tracedChildren ?? [];
+    const childUsageAlreadyTraced = event.toolName === "subagent" && Boolean(childResults?.length)
+      && childResults!.every(child => child.index !== undefined && tracedChildren.includes(`${result?.details?.runId}:${child.index}`));
+    if (childUsageAlreadyTraced) open.obs.update({metadata:{usage_source:"linked_child_generations", aggregate_usage_omitted:true}});
+    if (result?.usage && !childUsageAlreadyTraced) {
+      ensureRuntime();
       const usageObs = startObservation(
         TOOL_USAGE_OBSERVATION_NAME,
         {
@@ -854,6 +981,7 @@ export default function (pi: ExtensionAPI) {
     },
     startedAt?: Date,
   ): void => {
+    ensureRuntime();
     if (state) {
       const obs = startObservation(name, attributes, {
         asType: "generation",

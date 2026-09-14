@@ -66,8 +66,7 @@ describe("integration: system prompt", () => {
         const [head, ...rest] = input as Array<{ role?: string; content?: unknown }>;
         assert.equal(head?.role, "system", `generation ${i} must start with a system message`);
         assert.equal(head?.content, systemPrompt, `generation ${i} must carry the captured prompt`);
-        assert.equal(rest.length, 1, `generation ${i} keeps exactly one base message`);
-        assert.equal(rest[0]!.role, i === 0 ? "user" : "tool");
+        assert.ok(rest.some((message) => message.role === (i === 0 ? "user" : "tool")), `generation ${i} retains its active message`);
       }
     } finally {
       capture.close();
