@@ -189,11 +189,11 @@ export function extractText(content: unknown): string {
     .join("");
 }
 
-export function extractToolCalls(content: unknown): Array<{ id: string; name: string }> {
+export function extractToolCalls(content: unknown): ChatMlToolCall[] {
   if (!Array.isArray(content)) return [];
   return content
     .filter((p): p is { type: string; id: string; name: string } => !!p && typeof p === "object" && (p as { type?: string }).type === "toolCall")
-    .map((p) => ({ id: p.id, name: p.name }));
+    .map((p) => ({ id: p.id, type: "function" as const, function: { name: p.name } }));
 }
 
 export interface PiImagePart {
@@ -828,6 +828,7 @@ export default function (pi: ExtensionAPI) {
 
     const text = extractText(message.content);
     const tools = extractToolCalls(message.content);
+    const thinking = extractThinking(message.content);
     const isError = message.stopReason === "error" || message.stopReason === "aborted";
     if (message.stopReason === "error") state.sawError = true;
 
@@ -835,6 +836,7 @@ export default function (pi: ExtensionAPI) {
       output: {
         role: "assistant",
         ...(text ? { content: text } : {}),
+        ...(thinking.length ? { thinking } : {}),
         ...(tools.length ? { tool_calls: tools } : {}),
       },
       model: message.responseModel || message.model,

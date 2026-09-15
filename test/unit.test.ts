@@ -100,8 +100,11 @@ describe("extractText / extractToolCalls", () => {
     assert.equal(extractText({}), "");
   });
 
-  it("extracts tool calls as {id, name} only (no arguments)", () => {
-    assert.deepEqual(extractToolCalls(content), [{ id: "call_1", name: "bash" }]);
+  it("extracts tool calls in the nested shape, without the arguments", () => {
+    assert.deepEqual(extractToolCalls(content), [
+      { id: "call_1", type: "function", function: { name: "bash" } },
+    ]);
+    assert.ok(!JSON.stringify(extractToolCalls(content)).includes("ls"));
   });
 });
 

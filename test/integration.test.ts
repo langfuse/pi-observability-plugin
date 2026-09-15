@@ -63,6 +63,11 @@ function contentsOf(span: CapturedSpan): string[] {
   return historyOf(span).map((m) => m.content ?? "");
 }
 
+function outputOf(span: CapturedSpan): TracedMessage {
+  const raw = span.attrs["langfuse.observation.output"];
+  return (typeof raw === "string" ? JSON.parse(raw) : raw) as TracedMessage;
+}
+
 function wireText(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -679,10 +684,22 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       await waitForRequests(capture, 2);
 
       const roots = byStart(findSpansByName(capture.spans(), "Conversational Turn"));
+      const firstTurn = byStart(
+        findSpansByName(capture.spans(), "LLM Call").filter((s) => s.traceId === roots[0]!.traceId),
+      );
       const secondTurn = byStart(
         findSpansByName(capture.spans(), "LLM Call").filter((s) => s.traceId === roots[1]!.traceId),
       );
       const history = historyOf(secondTurn[0]!);
+
+      const answer = outputOf(firstTurn.at(-1)!);
+      assert.deepEqual(answer.thinking, [{ type: "thinking", content: FINAL_ANSWER_THINKING }]);
+      assert.equal(answer.content, "This is the test workspace. Done.");
+      const toolStep = outputOf(firstTurn[0]!);
+      assert.equal(toolStep.thinking, undefined, "a step that did not reason carries no thinking block");
+      assert.deepEqual(toolStep.tool_calls, [
+        { id: toolStep.tool_calls![0]!.id, type: "function", function: { name: "bash" } },
+      ]);
 
       const reasoning = history.filter((m) => m.thinking);
       assert.equal(reasoning.length, 1, "only the step that reasoned carries a thinking block");
