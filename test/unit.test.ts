@@ -14,6 +14,8 @@ import {
   buildHistoryInput,
   markDataUris,
   extractThinking,
+  splitInlineThinking,
+  extractAnswerAndThinking,
   toChatMlMessage,
   type ChatMlMessage,
   type PiUsage,
@@ -683,5 +685,30 @@ describe("extractThinking", () => {
   it("keeps a long reasoning block whole", () => {
     const parts = extractThinking([{ type: "thinking", thinking: "z".repeat(120_000) }]);
     assert.equal(parts[0]!.content.length, 120_000);
+  });
+});
+
+describe("splitInlineThinking", () => {
+  it("splits a leading <think> block out of the answer text", () => {
+    assert.deepEqual(splitInlineThinking("<think>hm, which files?</think>\nThe answer."), {
+      text: "The answer.",
+      thinking: [{ type: "thinking", content: "hm, which files?" }],
+    });
+  });
+
+  it("keeps a <think> tag the answer only talks about", () => {
+    const answer = "Strip the <think> tags with a regex before parsing.";
+    assert.deepEqual(splitInlineThinking(answer), { text: answer, thinking: [] });
+  });
+});
+
+describe("extractAnswerAndThinking", () => {
+  it("prefers structured thinking parts over inline tags", () => {
+    const result = extractAnswerAndThinking([
+      { type: "thinking", thinking: "structured" },
+      { type: "text", text: "<think>inline</think>answer" },
+    ]);
+    assert.deepEqual(result.thinking, [{ type: "thinking", content: "structured" }]);
+    assert.equal(result.text, "<think>inline</think>answer");
   });
 });

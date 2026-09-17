@@ -445,6 +445,31 @@ export function extractThinking(content: unknown): ChatMlThinkingPart[] {
   return parts;
 }
 
+const THINK_TAG_PATTERN = /<think>([\s\S]*?)(?:<\/think>|$)/g;
+
+export function splitInlineThinking(text: string): {
+  text: string;
+  thinking: ChatMlThinkingPart[];
+} {
+  if (!text.trimStart().startsWith("<think>")) return { text, thinking: [] };
+  const blocks: Array<{ type: "thinking"; thinking: string }> = [];
+  const answer = text.replace(THINK_TAG_PATTERN, (_match, inner: string) => {
+    if (inner.trim()) blocks.push({ type: "thinking", thinking: inner.trim() });
+    return "";
+  });
+  return { text: answer.trim(), thinking: extractThinking(blocks) };
+}
+
+export function extractAnswerAndThinking(content: unknown): {
+  text: string;
+  thinking: ChatMlThinkingPart[];
+} {
+  const text = extractText(content);
+  const thinking = extractThinking(content);
+  if (thinking.length) return { text, thinking };
+  return splitInlineThinking(text);
+}
+
 export function toChatMlMessage(message: unknown): ChatMlMessage | undefined {
   if (!message || typeof message !== "object") return undefined;
   const msg = message as {
@@ -458,8 +483,8 @@ export function toChatMlMessage(message: unknown): ChatMlMessage | undefined {
     return { role: "user", content: markDataUris(renderHistoryContent(msg.content)) };
   }
   if (msg.role === "assistant") {
-    const content = markDataUris(extractText(msg.content));
-    const thinking = extractThinking(msg.content);
+    const { text, thinking } = extractAnswerAndThinking(msg.content);
+    const content = markDataUris(text);
     const toolCalls = historyToolCalls(msg.content);
     if (!content && !thinking.length && !toolCalls.length) return undefined;
     return {
@@ -909,7 +934,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_update", (event) => {
     const gen = state?.openGeneration;
     if (!gen || gen.finished || gen.sawFirstToken) return;
-    if (extractText((event.message as { content?: unknown })?.content).length > 0) {
+    const content = (event.message as { content?: unknown })?.content;
+    if (extractText(content).length > 0 || extractThinking(content).length > 0) {
       gen.sawFirstToken = true;
       gen.obs.update({ completionStartTime: new Date() });
     }
@@ -933,9 +959,8 @@ export default function (pi: ExtensionAPI) {
     const gen = state.openGeneration;
     if (!gen || gen.finished) return;
 
-    const text = extractText(message.content);
+    const { text, thinking } = extractAnswerAndThinking(message.content);
     const tools = extractToolCalls(message.content);
-    const thinking = extractThinking(message.content);
     const isError = message.stopReason === "error" || message.stopReason === "aborted";
     if (message.stopReason === "error") state.sawError = true;
 

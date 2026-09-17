@@ -726,4 +726,39 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       capture.close();
     }
   });
+
+  it("splits reasoning a server streams inline as <think> tags", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const env = buildLangfuseEnv(capture);
+      assert.equal((await runPi(sandbox, "[inline-think] Summarize this", { env })).status, 0);
+      await waitForRequests(capture, 1);
+
+      const answer = outputOf(byStart(findSpansByName(capture.spans(), "LLM Call")).at(-1)!);
+      assert.deepEqual(answer.thinking, [{ type: "thinking", content: FINAL_ANSWER_THINKING }]);
+      assert.equal(answer.content, "This is the test workspace. Done.");
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("times the first token from the first thinking token", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const env = buildLangfuseEnv(capture);
+      assert.equal((await runPi(sandbox, "[think-tool] Summarize this", { env })).status, 0);
+      await waitForRequests(capture, 1);
+
+      const reasoned = byStart(findSpansByName(capture.spans(), "LLM Call"))[0]!;
+      assert.equal(outputOf(reasoned).content, undefined, "this step streamed no text");
+      assert.ok(
+        reasoned.attrs["langfuse.observation.completion_start_time"],
+        "a thinking-only step must still report a time to first token",
+      );
+    } finally {
+      capture.close();
+    }
+  });
 });
