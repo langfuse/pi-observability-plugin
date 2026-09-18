@@ -5,7 +5,7 @@
  * session grouping and turn numbering.
  */
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
@@ -455,6 +455,34 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       assert.equal(root!.attrs["user.id"], "file-user");
     } finally {
       capture.close();
+    }
+  });
+
+  it("exports to the project target instead of the global target", async () => {
+    const project = await startCaptureServer();
+    const global = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      mkdirSync(join(sandbox.workspace, ".pi"));
+      for (const [directory, capture, userId] of [
+        [sandbox.agentDir, global, "global-user"],
+        [join(sandbox.workspace, ".pi"), project, "project-user"],
+      ] as const) {
+        writeFileSync(join(directory, "langfuse.json"), JSON.stringify({
+          publicKey: "pk-lf-test", secretKey: "sk-lf-test",
+          baseUrl: `http://127.0.0.1:${capture.port}`, userId,
+        }));
+      }
+      const result = await runPi(sandbox, "Trace me via project config");
+      assert.equal(result.status, 0, result.stderr);
+      await waitForRequests(project, 1);
+      const root = findSpansByName(project.spans(), "Conversational Turn")[0];
+      assert.ok(root, "project target must receive a trace");
+      assert.equal(root.attrs["user.id"], "project-user");
+      assert.equal(global.requests.length, 0, "global target must receive nothing");
+    } finally {
+      project.close();
+      global.close();
     }
   });
 

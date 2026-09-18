@@ -114,17 +114,24 @@ export function loadConfig(): LangfuseConfig | undefined {
 }
 
 function readConfigFile(): Partial<Record<keyof LangfuseConfig, unknown>> {
-  try {
-    const path = join(getAgentDir(), "langfuse.json");
-    if (!existsSync(path)) return {};
-    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
-  } catch (error) {
-    console.error(
-      `[pi-langfuse] Ignoring unreadable langfuse.json: ${(error as Error).message}`,
-    );
-    return {};
+  const candidates = [
+    join(process.cwd(), ".pi", "langfuse.json"),
+    join(getAgentDir(), "langfuse.json"),
+  ];
+  for (const path of candidates) {
+    try {
+      if (!existsSync(path)) continue;
+      const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch (error) {
+      console.error(
+        `[pi-langfuse] Ignoring unreadable ${path}: ${(error as Error).message}`,
+      );
+    }
   }
+  return {};
 }
 
 // ---------------------------------------------------------------------------
