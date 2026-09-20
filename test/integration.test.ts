@@ -435,6 +435,43 @@ describe("integration: pi -> extension -> Langfuse export", () => {
     }
   });
 
+  it("sends a traceparent naming the turn root so a gateway can join the trace", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const before = mock.headers().length;
+      const result = await runPi(sandbox, "Explore this project and summarize it", {
+        env: buildLangfuseEnv(capture),
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+
+      const spans = capture.spans();
+      const root = findSpansByName(spans, "Conversational Turn")[0];
+      assert.ok(root, "expected a turn root span");
+
+      const sent = mock.headers().slice(before);
+      assert.ok(sent.length > 0, "the provider must have been called at all");
+
+      const expected = `00-${root.traceId}-${root.spanId}-01`;
+      for (const [i, headers] of sent.entries()) {
+        assert.equal(
+          headers.traceparent,
+          expected,
+          `request ${i} must carry the turn root as its traceparent`,
+        );
+      }
+
+      // Guards against the assertion passing on a span tree that never linked:
+      // the header has to name a root that was actually exported.
+      assert.ok(
+        spans.some((s) => s.traceId === root.traceId && s.name === "LLM Call"),
+        "the generation must share the trace the header advertises",
+      );
+    } finally {
+      capture.close();
+    }
+  });
+
   it("reads credentials from the agent-dir config file when no env vars are set", async () => {
     const capture = await startCaptureServer();
     try {

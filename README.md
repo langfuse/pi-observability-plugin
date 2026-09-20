@@ -28,6 +28,43 @@ Langfuse as its own trace:
   render inside the trace.
 - **Subagents**: Pi processes spawned by other extensions nest under the turn
   that started them.
+- **Gateways**: each model request carries a W3C `traceparent` naming the turn
+  root, so a tracing-aware proxy in front of the provider records its span in
+  the same trace instead of starting its own.
+
+## Tracing through a gateway
+
+If your provider endpoint is a tracing-aware proxy — LiteLLM, or anything that
+exports OpenTelemetry spans of its own — it would otherwise trace the same
+request separately, leaving you with two unrelated traces of one call.
+
+Every provider request therefore carries a W3C `traceparent` naming the current
+turn root:
+
+```
+traceparent: 00-<turn trace id>-<turn root span id>-01
+```
+
+A gateway that honours inbound trace context then produces:
+
+```
+Conversational Turn      (this plugin)
+├── LLM Call             (this plugin)
+└── <gateway's span>     (the proxy)
+```
+
+The header names the **turn root**, not the matching `LLM Call`. Pi fires
+`before_provider_headers` before `before_provider_request`, so the generation for
+that call does not exist yet and the root is the only span available — the
+gateway's span is a sibling of `LLM Call` rather than its child.
+
+No header is sent when there is no turn in flight, which covers compaction,
+branch summaries and cache warming. Providers that do not understand the header
+ignore it.
+
+Note that the plugin and the gateway now report the **same** tokens in one
+trace. They are two independent measurements of one request, so adding them up
+double-counts.
 
 ## Prerequisites
 
