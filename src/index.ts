@@ -73,6 +73,16 @@ export function readInheritedParent(env: NodeJS.ProcessEnv = process.env): Inher
   };
 }
 
+export function formatTraceparent(ctx: SpanContext): string {
+  return `00-${ctx.traceId}-${ctx.spanId}-${(ctx.traceFlags & 0xff).toString(16).padStart(2, "0")}`;
+}
+
+export function findTraceparentHeader(
+  headers: Record<string, string | null>,
+): string | undefined {
+  return Object.keys(headers).find((key) => key.toLowerCase() === "traceparent");
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -711,11 +721,6 @@ export default function (pi: ExtensionAPI) {
     state.openGeneration = undefined;
   };
 
-  // W3C trace-context `traceparent`, version 00.
-  // https://www.w3.org/TR/trace-context/#traceparent-header
-  const formatTraceparent = (ctx: SpanContext): string =>
-    `00-${ctx.traceId}-${ctx.spanId}-${(ctx.traceFlags & 0xff).toString(16).padStart(2, "0")}`;
-
   // The turn root is the parent for subagents. pi runs tool calls in parallel,
   // so one global variable cannot point to one of many tool spans.
   const publishParentContext = (root: LangfuseSpan, sessionId: string) => {
@@ -879,11 +884,13 @@ export default function (pi: ExtensionAPI) {
   // This fires before `before_provider_request`, so the generation for this
   // call does not exist yet and the turn root is the only span available. The
   // gateway's span becomes a sibling of `LLM Call` rather than its child.
-  //
-  // Skipped when no turn is in flight. Compaction, branch summaries and cache
-  // warming all reach this hook, and there is no turn for them to attach to.
   pi.on("before_provider_headers", (event) => {
     if (!state) return;
+    const existing = findTraceparentHeader(event.headers);
+    if (existing !== undefined) {
+      debug("traceparent already set, leaving it", existing, event.headers[existing]);
+      return;
+    }
     const ctx = state.root.otelSpan.spanContext();
     // Matches publishParentContext: never point at a root the sampler dropped.
     if (!(ctx.traceFlags & TraceFlags.SAMPLED)) return;

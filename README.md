@@ -58,9 +58,18 @@ The header names the **turn root**, not the matching `LLM Call`. Pi fires
 that call does not exist yet and the root is the only span available — the
 gateway's span is a sibling of `LLM Call` rather than its child.
 
-No header is sent when there is no turn in flight, which covers compaction,
-branch summaries and cache warming. Providers that do not understand the header
-ignore it.
+No header is sent when no turn is in flight, so an idle `/compact` or a branch
+summary from session-tree navigation does not carry one. Automatic mid-turn
+compaction does, which matches where this plugin already puts its own
+`Compaction` generation: under the turn root.
+
+If a `traceparent` is already on the request — from a `headers` block in
+`models.json`, or from another extension — the plugin leaves it alone, in any
+casing. Writing ours next to it would either silently replace it (the api
+dialects that hand headers to a vendor SDK dedupe case-insensitively, last one
+wins) or merge the two into `traceparent: "<theirs>, <ours>"`, which is not a
+valid traceparent at all (the dialects that use plain `fetch`). Providers that
+do not understand the header ignore it.
 
 Note that the plugin and the gateway now report the **same** tokens in one
 trace. They are two independent measurements of one request, so adding them up

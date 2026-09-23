@@ -472,6 +472,48 @@ describe("integration: pi -> extension -> Langfuse export", () => {
     }
   });
 
+  it("leaves a traceparent the user configured alone instead of sending two", async () => {
+    const capture = await startCaptureServer();
+    const configured = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    try {
+      const sandbox = createSandbox(mock.port, { providerHeaders: { Traceparent: configured } });
+      const before = mock.rawHeaders().length;
+      const result = await runPi(sandbox, "Explore this project and summarize it", {
+        env: buildLangfuseEnv(capture),
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+
+      const sentRaw = mock.rawHeaders().slice(before);
+      assert.ok(sentRaw.length > 0, "the provider must have been called at all");
+
+      const root = findSpansByName(capture.spans(), "Conversational Turn")[0];
+      assert.ok(root, "expected a turn root span");
+
+      for (const [i, raw] of sentRaw.entries()) {
+        const traceparents: string[][] = [];
+        for (let k = 0; k < raw.length; k += 2) {
+          if (raw[k]!.toLowerCase() === "traceparent") traceparents.push([raw[k]!, raw[k + 1]!]);
+        }
+        assert.equal(
+          traceparents.length,
+          1,
+          `request ${i} must carry exactly one traceparent, got ${JSON.stringify(traceparents)}`,
+        );
+        assert.equal(
+          traceparents[0]![1],
+          configured,
+          `request ${i} must keep the configured traceparent untouched`,
+        );
+        assert.ok(
+          !traceparents[0]![1].includes(root.spanId),
+          `request ${i} must not have our turn root merged into it`,
+        );
+      }
+    } finally {
+      capture.close();
+    }
+  });
+
   it("reads credentials from the agent-dir config file when no env vars are set", async () => {
     const capture = await startCaptureServer();
     try {
