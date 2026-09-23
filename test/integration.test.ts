@@ -20,6 +20,7 @@ import {
   runPi,
   startCaptureServer,
   startMockProvider,
+  THINK_ONLY_REASONING,
   waitForRequests,
 } from "./helpers.ts";
 
@@ -722,6 +723,65 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       const withReasoning = sent.at(-1)!.filter((m) => m.reasoning_content);
       assert.equal(withReasoning.length, 1);
       assert.equal(withReasoning[0]!.reasoning_content, FINAL_ANSWER_THINKING);
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("times the first token when the completion is only a tool call", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const result = await runPi(sandbox, "[tool-only] List the workspace.", {
+        env: buildLangfuseEnv(capture),
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+      await waitForRequests(capture, 1);
+
+      const generations = byStart(findSpansByName(capture.spans(), "LLM Call"));
+      assert.equal(generations.length, 2);
+      const toolOnly = generations[0]!;
+
+      const output = outputOf(toolOnly);
+      assert.equal(output.content, undefined, "the first generation must carry no text");
+      assert.equal(output.thinking, undefined, "the first generation must carry no reasoning");
+      assert.equal(output.tool_calls?.length, 1, "its whole completion is one tool call");
+
+      assert.ok(
+        toolOnly.attrs["langfuse.observation.completion_start_time"],
+        "a generation whose only output is a tool call must still report a TTFT",
+      );
+      assert.ok(
+        generations[1]!.attrs["langfuse.observation.completion_start_time"],
+        "the text generation keeps its TTFT",
+      );
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("times the first token when reasoning arrives before any text", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const result = await runPi(sandbox, "[think-only] List the workspace.", {
+        env: buildLangfuseEnv(capture),
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+      await waitForRequests(capture, 1);
+
+      const generations = byStart(findSpansByName(capture.spans(), "LLM Call"));
+      assert.equal(generations.length, 2);
+      const thinkOnly = generations[0]!;
+
+      const output = outputOf(thinkOnly);
+      assert.equal(output.content, undefined, "the reasoning step must carry no text");
+      assert.deepEqual(output.thinking, [{ type: "thinking", content: THINK_ONLY_REASONING }]);
+
+      assert.ok(
+        thinkOnly.attrs["langfuse.observation.completion_start_time"],
+        "a generation that reasons before calling a tool must still report a TTFT",
+      );
     } finally {
       capture.close();
     }

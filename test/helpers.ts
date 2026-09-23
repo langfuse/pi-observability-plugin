@@ -101,6 +101,8 @@ export const SUMMARIZATION_USAGE = { prompt: 3571, completion: 313 };
 export const FINAL_ANSWER_THINKING =
   "The workspace holds a single README, so a one-line summary answers the prompt.";
 
+export const THINK_ONLY_REASONING = "I should list the directory before answering.";
+
 export function startMockProvider(): Promise<MockProvider> {
   const sentMessages: OpenAiMessage[][] = [];
   const received: Array<Record<string, unknown>> = [];
@@ -121,6 +123,8 @@ export function startMockProvider(): Promise<MockProvider> {
       const stage = messages.slice(lastUserIdx + 1).filter((m) => m.role === "tool").length;
       const lastUser = messages[lastUserIdx];
       const failMode = JSON.stringify(lastUser?.content ?? "").includes("[fail]");
+      const toolOnlyMode = JSON.stringify(lastUser?.content ?? "").includes("[tool-only]");
+      const thinkOnlyMode = JSON.stringify(lastUser?.content ?? "").includes("[think-only]");
       // True only when a test loads the subagent fixture. The default script
       // does not change for the other tests.
       const canDelegate = (payload.tools ?? []).some((t) => t.function?.name === "subagent");
@@ -172,6 +176,31 @@ export function startMockProvider(): Promise<MockProvider> {
           text: "The file does not exist, so I stopped.",
           finish: "stop",
           usage: usage(980, 30, 512),
+        });
+      } else if (toolOnlyMode && stage === 0) {
+        streamChunks(res, model, {
+          tool: { name: "bash", args: { command: "ls" } },
+          finish: "tool_calls",
+          usage: usage(1100, 24, 0),
+        });
+      } else if (thinkOnlyMode && stage === 0) {
+        streamChunks(res, model, {
+          thinking: THINK_ONLY_REASONING,
+          tool: { name: "bash", args: { command: "ls" } },
+          finish: "tool_calls",
+          usage: usage(1100, 40, 0, 18),
+        });
+      } else if (thinkOnlyMode) {
+        streamChunks(res, model, {
+          text: "Listed the workspace. Done.",
+          finish: "stop",
+          usage: usage(1250, 30, 0),
+        });
+      } else if (toolOnlyMode) {
+        streamChunks(res, model, {
+          text: "Listed the workspace. Done.",
+          finish: "stop",
+          usage: usage(1250, 30, 0),
         });
       } else if (stage === 0) {
         streamChunks(res, model, {
