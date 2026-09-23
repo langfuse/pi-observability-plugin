@@ -73,6 +73,16 @@ export function readInheritedParent(env: NodeJS.ProcessEnv = process.env): Inher
   };
 }
 
+export function formatTraceparent(ctx: SpanContext): string {
+  return `00-${ctx.traceId}-${ctx.spanId}-${(ctx.traceFlags & 0xff).toString(16).padStart(2, "0")}`;
+}
+
+export function findTraceparentHeader(
+  headers: Record<string, string | null>,
+): string | undefined {
+  return Object.keys(headers).find((key) => key.toLowerCase() === "traceparent");
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -864,6 +874,28 @@ export default function (pi: ExtensionAPI) {
       state.root.update({ metadata: { system_prompt: systemPrompt } });
     } catch {}
     debug("system prompt captured", systemPrompt.length);
+  });
+
+  // Propagate the turn root to the model endpoint. A tracing-aware gateway in
+  // front of the provider — LiteLLM, an OTel collector — otherwise starts its
+  // own trace for the same request, so one call is recorded twice with nothing
+  // relating the two halves.
+  //
+  // This fires before `before_provider_request`, so the generation for this
+  // call does not exist yet and the turn root is the only span available. The
+  // gateway's span becomes a sibling of `LLM Call` rather than its child.
+  pi.on("before_provider_headers", (event) => {
+    if (!state) return;
+    const existing = findTraceparentHeader(event.headers);
+    if (existing !== undefined) {
+      debug("traceparent already set, leaving it", existing, event.headers[existing]);
+      return;
+    }
+    const ctx = state.root.otelSpan.spanContext();
+    // Matches publishParentContext: never point at a root the sampler dropped.
+    if (!(ctx.traceFlags & TraceFlags.SAMPLED)) return;
+    event.headers.traceparent = formatTraceparent(ctx);
+    debug("traceparent", event.headers.traceparent);
   });
 
   pi.on("before_provider_request", (event, ctx) => {

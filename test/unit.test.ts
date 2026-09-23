@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { TraceFlags } from "@opentelemetry/api";
 import {
   extractText,
   readInheritedParent,
+  formatTraceparent,
+  findTraceparentHeader,
   buildCostDetails,
   describeImage,
   extractImages,
@@ -416,6 +419,47 @@ describe("readInheritedParent", () => {
     const base = { LANGFUSE_PI_PARENT_TRACE_ID: traceId, LANGFUSE_PI_PARENT_SPAN_ID: spanId };
     assert.equal(readInheritedParent(base)?.depth, 0);
     assert.equal(readInheritedParent({ ...base, LANGFUSE_PI_PARENT_DEPTH: "abc" })?.depth, 0);
+  });
+});
+
+describe("formatTraceparent", () => {
+  const traceId = "0af7651916cd43dd8448eb211c80319c";
+  const spanId = "b7ad6b7169203331";
+
+  it("renders the four version-00 fields a gateway parses", () => {
+    assert.equal(
+      formatTraceparent({ traceId, spanId, traceFlags: TraceFlags.SAMPLED }),
+      `00-${traceId}-${spanId}-01`,
+    );
+  });
+
+  it("pads the flags to two hex digits, as the spec requires", () => {
+    assert.equal(
+      formatTraceparent({ traceId, spanId, traceFlags: TraceFlags.NONE }),
+      `00-${traceId}-${spanId}-00`,
+    );
+  });
+
+  it("matches the W3C grammar, not just our own idea of the shape", () => {
+    const header = formatTraceparent({ traceId, spanId, traceFlags: TraceFlags.SAMPLED });
+    assert.match(header, /^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/);
+  });
+});
+
+describe("findTraceparentHeader", () => {
+  it("finds the header whatever its casing, so we never send two", () => {
+    assert.equal(findTraceparentHeader({ Traceparent: "x" }), "Traceparent");
+    assert.equal(findTraceparentHeader({ TRACEPARENT: "x" }), "TRACEPARENT");
+    assert.equal(findTraceparentHeader({ traceparent: "x" }), "traceparent");
+  });
+
+  it("reports a null value, which is pi's way of deleting a header", () => {
+    assert.equal(findTraceparentHeader({ traceparent: null }), "traceparent");
+  });
+
+  it("returns undefined on an unrelated header set", () => {
+    assert.equal(findTraceparentHeader({}), undefined);
+    assert.equal(findTraceparentHeader({ tracestate: "a=1", "x-traceparent": "x" }), undefined);
   });
 });
 

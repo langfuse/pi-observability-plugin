@@ -40,6 +40,9 @@ export interface MockProvider {
   sentMessages: OpenAiMessage[][];
   /** Request bodies the provider received, in call order. */
   payloads: () => Array<Record<string, unknown>>;
+  /** Request headers the provider received, in call order. */
+  headers: () => Array<http.IncomingHttpHeaders>;
+  rawHeaders: () => string[][];
 }
 
 function writeSseEvent(res: http.ServerResponse, obj: unknown) {
@@ -104,6 +107,8 @@ export const FINAL_ANSWER_THINKING =
 export function startMockProvider(): Promise<MockProvider> {
   const sentMessages: OpenAiMessage[][] = [];
   const received: Array<Record<string, unknown>> = [];
+  const receivedHeaders: Array<http.IncomingHttpHeaders> = [];
+  const receivedRawHeaders: string[][] = [];
   const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -114,6 +119,8 @@ export function startMockProvider(): Promise<MockProvider> {
         tools?: Array<{ function?: { name?: string } }>;
       };
       received.push(payload as Record<string, unknown>);
+      receivedHeaders.push(req.headers);
+      receivedRawHeaders.push([...req.rawHeaders]);
       const messages = payload.messages ?? [];
       sentMessages.push(messages);
       const model = payload.model ?? "mock-gpt-1";
@@ -200,7 +207,14 @@ export function startMockProvider(): Promise<MockProvider> {
   return new Promise((resolvePromise) => {
     server.listen(0, "127.0.0.1", () => {
       const port = (server.address() as { port: number }).port;
-      resolvePromise({ port, sentMessages, close: () => server.close(), payloads: () => [...received] });
+      resolvePromise({
+        port,
+        sentMessages,
+        close: () => server.close(),
+        payloads: () => [...received],
+        headers: () => [...receivedHeaders],
+        rawHeaders: () => receivedRawHeaders.map((h) => [...h]),
+      });
     });
   });
 }
@@ -320,6 +334,7 @@ export interface SandboxOptions {
   keepRecentTokens?: number;
   /** Pads README.md so reading it grows the context past keepRecentTokens. */
   readmeFillerLines?: number;
+  providerHeaders?: Record<string, string>;
 }
 
 export function createSandbox(mockPort: number, opts: SandboxOptions = {}): Sandbox {
@@ -341,6 +356,7 @@ export function createSandbox(mockPort: number, opts: SandboxOptions = {}): Sand
           baseUrl: `http://127.0.0.1:${mockPort}/v1`,
           api: "openai-completions",
           apiKey: "mock-key",
+          ...(opts.providerHeaders ? { headers: opts.providerHeaders } : {}),
           models: [
             {
               id: "mock-gpt-1",

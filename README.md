@@ -28,6 +28,52 @@ Langfuse as its own trace:
   render inside the trace.
 - **Subagents**: Pi processes spawned by other extensions nest under the turn
   that started them.
+- **Gateways**: each model request carries a W3C `traceparent` naming the turn
+  root, so a tracing-aware proxy in front of the provider records its span in
+  the same trace instead of starting its own.
+
+## Tracing through a gateway
+
+If your provider endpoint is a tracing-aware proxy — LiteLLM, or anything that
+exports OpenTelemetry spans of its own — it would otherwise trace the same
+request separately, leaving you with two unrelated traces of one call.
+
+Every provider request therefore carries a W3C `traceparent` naming the current
+turn root:
+
+```
+traceparent: 00-<turn trace id>-<turn root span id>-01
+```
+
+A gateway that honours inbound trace context then produces:
+
+```
+Conversational Turn      (this plugin)
+├── LLM Call             (this plugin)
+└── <gateway's span>     (the proxy)
+```
+
+The header names the **turn root**, not the matching `LLM Call`. Pi fires
+`before_provider_headers` before `before_provider_request`, so the generation for
+that call does not exist yet and the root is the only span available — the
+gateway's span is a sibling of `LLM Call` rather than its child.
+
+No header is sent when no turn is in flight, so an idle `/compact` or a branch
+summary from session-tree navigation does not carry one. Automatic mid-turn
+compaction does, which matches where this plugin already puts its own
+`Compaction` generation: under the turn root.
+
+If a `traceparent` is already on the request — from a `headers` block in
+`models.json`, or from another extension — the plugin leaves it alone, in any
+casing. Writing ours next to it would either silently replace it (the api
+dialects that hand headers to a vendor SDK dedupe case-insensitively, last one
+wins) or merge the two into `traceparent: "<theirs>, <ours>"`, which is not a
+valid traceparent at all (the dialects that use plain `fetch`). Providers that
+do not understand the header ignore it.
+
+Note that the plugin and the gateway now report the **same** tokens in one
+trace. They are two independent measurements of one request, so adding them up
+double-counts.
 
 ## Prerequisites
 
