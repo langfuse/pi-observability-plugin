@@ -39,38 +39,72 @@ const EMIT_IMAGE_MEDIA = (() => {
   return raw ? !["false", "0"].includes(raw) : true;
 })();
 
+const ENV_TRACEPARENT = "LANGFUSE_PI_TRACEPARENT";
 const ENV_PARENT_TRACE_ID = "LANGFUSE_PI_PARENT_TRACE_ID";
 const ENV_PARENT_SPAN_ID = "LANGFUSE_PI_PARENT_SPAN_ID";
 const ENV_PARENT_SESSION_ID = "LANGFUSE_PI_PARENT_SESSION_ID";
 const ENV_PARENT_DEPTH = "LANGFUSE_PI_PARENT_DEPTH";
+const ENV_PARENT_EXTERNAL_TRACE = "LANGFUSE_PI_PARENT_EXTERNAL_TRACE";
 
 const HEX_TRACE_ID = /^[0-9a-f]{32}$/;
 const HEX_SPAN_ID = /^[0-9a-f]{16}$/;
+
+const isUsableTraceId = (v: string | undefined): v is string =>
+  !!v && HEX_TRACE_ID.test(v) && !/^0+$/.test(v);
+const isUsableSpanId = (v: string | undefined): v is string =>
+  !!v && HEX_SPAN_ID.test(v) && !/^0+$/.test(v);
+
+const TRACEPARENT = /^(?!ff)([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})(-.*)?$/;
+
+export function parseTraceparent(value: string): { traceId: string; spanId: string } | undefined {
+  const match = TRACEPARENT.exec(value.trim().toLowerCase());
+  if (!match) return undefined;
+  const [, version, traceId, spanId, , trailing] = match;
+  if (version === "00" && trailing) return undefined;
+  if (!isUsableTraceId(traceId) || !isUsableSpanId(spanId)) return undefined;
+  return { traceId, spanId };
+}
 
 export interface InheritedParent {
   spanContext: SpanContext;
   sessionId?: string;
   depth: number;
+  source: "subagent" | "attached";
+  externalTrace: boolean;
 }
 
 export function readInheritedParent(env: NodeJS.ProcessEnv = process.env): InheritedParent | undefined {
-  const traceId = env[ENV_PARENT_TRACE_ID]?.trim().toLowerCase();
-  const spanId = env[ENV_PARENT_SPAN_ID]?.trim().toLowerCase();
-  if (!traceId || !spanId) return undefined;
-  if (!HEX_TRACE_ID.test(traceId) || !HEX_SPAN_ID.test(spanId)) return undefined;
-  // OTel defines the all-zero ids as invalid.
-  if (/^0+$/.test(traceId) || /^0+$/.test(spanId)) return undefined;
+  const parent = readParentIds(env);
+  if (!parent) return undefined;
   const depth = Number(env[ENV_PARENT_DEPTH] ?? "0");
   return {
     spanContext: {
-      traceId,
-      spanId,
+      traceId: parent.traceId,
+      spanId: parent.spanId,
       traceFlags: TraceFlags.SAMPLED,
       isRemote: true,
     },
     sessionId: env[ENV_PARENT_SESSION_ID]?.trim() || undefined,
     depth: Number.isFinite(depth) && depth > 0 ? depth : 0,
+    source: parent.source,
+    externalTrace: parent.source === "attached" || env[ENV_PARENT_EXTERNAL_TRACE] === "1",
   };
+}
+
+type ParentIds = { traceId: string; spanId: string; source: "subagent" | "attached" };
+
+function readParentIds(env: NodeJS.ProcessEnv): ParentIds | undefined {
+  const raw = env[ENV_TRACEPARENT]?.trim();
+  if (raw) {
+    const parsed = parseTraceparent(raw);
+    if (parsed) return { ...parsed, source: "attached" };
+    console.error(`[pi-langfuse] Ignoring malformed ${ENV_TRACEPARENT}: ${JSON.stringify(raw)}`);
+  }
+  const traceId = env[ENV_PARENT_TRACE_ID]?.trim().toLowerCase();
+  const spanId = env[ENV_PARENT_SPAN_ID]?.trim().toLowerCase();
+  if (!traceId && !spanId) return undefined;
+  if (!isUsableTraceId(traceId) || !isUsableSpanId(spanId)) return undefined;
+  return { traceId, spanId, source: "subagent" };
 }
 
 // ---------------------------------------------------------------------------
@@ -661,11 +695,15 @@ export default function (pi: ExtensionAPI) {
   let lastContextHistory: ChatMlMessage[] | undefined;
   let compactionStartedAt: Date | undefined;
   const inheritedParent = readInheritedParent();
+  const isAttached = inheritedParent?.source === "attached";
+  const externalTrace = inheritedParent?.externalTrace ?? false;
   const inheritedParentEnv: Record<string, string | undefined> = {
+    [ENV_TRACEPARENT]: process.env[ENV_TRACEPARENT],
     [ENV_PARENT_TRACE_ID]: process.env[ENV_PARENT_TRACE_ID],
     [ENV_PARENT_SPAN_ID]: process.env[ENV_PARENT_SPAN_ID],
     [ENV_PARENT_SESSION_ID]: process.env[ENV_PARENT_SESSION_ID],
     [ENV_PARENT_DEPTH]: process.env[ENV_PARENT_DEPTH],
+    [ENV_PARENT_EXTERNAL_TRACE]: process.env[ENV_PARENT_EXTERNAL_TRACE],
   };
 
   const ensureRuntime = (): Runtime => {
@@ -718,10 +756,13 @@ export default function (pi: ExtensionAPI) {
     // Do not publish a root that the sampler dropped. Child spans would point
     // to a trace with no exported root.
     if (!(ctx.traceFlags & TraceFlags.SAMPLED)) return;
+    delete process.env[ENV_TRACEPARENT];
     process.env[ENV_PARENT_TRACE_ID] = ctx.traceId;
     process.env[ENV_PARENT_SPAN_ID] = ctx.spanId;
     process.env[ENV_PARENT_SESSION_ID] = sessionId;
     process.env[ENV_PARENT_DEPTH] = String((inheritedParent?.depth ?? 0) + 1);
+    if (externalTrace) process.env[ENV_PARENT_EXTERNAL_TRACE] = "1";
+    else delete process.env[ENV_PARENT_EXTERNAL_TRACE];
   };
 
   // A child must not attach to a turn that has ended. The inherited values
@@ -805,15 +846,17 @@ export default function (pi: ExtensionAPI) {
     const userText = [event.prompt, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
     lastPromptText = userText;
     lastContextHistory = undefined;
-    const isSubagent = Boolean(inheritedParent);
-    traceAttributes = {
-      ...(isSubagent ? {} : { [LangfuseOtelSpanAttributes.TRACE_NAME]: TRACE_NAME }),
-      [LangfuseOtelSpanAttributes.TRACE_SESSION_ID]: isSubagent
-        ? (inheritedParent!.sessionId ?? sessionId)
-        : sessionId,
-      [LangfuseOtelSpanAttributes.TRACE_TAGS]: BASE_TAGS,
-      ...(config.userId ? { [LangfuseOtelSpanAttributes.TRACE_USER_ID]: config.userId } : {}),
-    };
+    const isSubagent = inheritedParent?.source === "subagent";
+    traceAttributes = externalTrace
+      ? {}
+      : {
+          ...(isSubagent ? {} : { [LangfuseOtelSpanAttributes.TRACE_NAME]: TRACE_NAME }),
+          [LangfuseOtelSpanAttributes.TRACE_SESSION_ID]: isSubagent
+            ? (inheritedParent!.sessionId ?? sessionId)
+            : sessionId,
+          [LangfuseOtelSpanAttributes.TRACE_TAGS]: BASE_TAGS,
+          ...(config.userId ? { [LangfuseOtelSpanAttributes.TRACE_USER_ID]: config.userId } : {}),
+        };
 
     const root = startObservation(
       isSubagent ? SUBAGENT_ROOT_OBSERVATION_NAME : ROOT_OBSERVATION_NAME,
@@ -831,6 +874,7 @@ export default function (pi: ExtensionAPI) {
           ...(isSubagent
             ? { pi_subagent: true, subagent_depth: inheritedParent!.depth, parent_session_id: inheritedParent!.sessionId }
             : {}),
+          ...(isAttached ? { attached_to_external_parent: true } : {}),
         },
       },
       { asType: "span", ...(inheritedParent ? { parentSpanContext: inheritedParent.spanContext } : {}) },
@@ -1081,12 +1125,14 @@ export default function (pi: ExtensionAPI) {
     // /compact in a fresh process would hit the unset tracer provider.
     ensureRuntime();
     const sessionId = ctx.sessionManager.getSessionId();
-    traceAttributes = {
-      ...(inheritedParent ? {} : { [LangfuseOtelSpanAttributes.TRACE_NAME]: `Pi ${name}` }),
-      [LangfuseOtelSpanAttributes.TRACE_SESSION_ID]: inheritedParent?.sessionId ?? sessionId,
-      [LangfuseOtelSpanAttributes.TRACE_TAGS]: BASE_TAGS,
-      ...(config.userId ? { [LangfuseOtelSpanAttributes.TRACE_USER_ID]: config.userId } : {}),
-    };
+    traceAttributes = externalTrace
+      ? {}
+      : {
+          ...(inheritedParent ? {} : { [LangfuseOtelSpanAttributes.TRACE_NAME]: `Pi ${name}` }),
+          [LangfuseOtelSpanAttributes.TRACE_SESSION_ID]: inheritedParent?.sessionId ?? sessionId,
+          [LangfuseOtelSpanAttributes.TRACE_TAGS]: BASE_TAGS,
+          ...(config.userId ? { [LangfuseOtelSpanAttributes.TRACE_USER_ID]: config.userId } : {}),
+        };
     const obs = startObservation(
       name,
       {

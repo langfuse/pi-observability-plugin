@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   extractText,
   readInheritedParent,
+  parseTraceparent,
   buildCostDetails,
   describeImage,
   extractImages,
@@ -416,6 +417,119 @@ describe("readInheritedParent", () => {
     const base = { LANGFUSE_PI_PARENT_TRACE_ID: traceId, LANGFUSE_PI_PARENT_SPAN_ID: spanId };
     assert.equal(readInheritedParent(base)?.depth, 0);
     assert.equal(readInheritedParent({ ...base, LANGFUSE_PI_PARENT_DEPTH: "abc" })?.depth, 0);
+  });
+
+  it("reads a W3C traceparent, which is the form a launcher's OTel SDK hands it", () => {
+    const parent = readInheritedParent({
+      LANGFUSE_PI_TRACEPARENT: `00-${traceId}-${spanId}-01`,
+      LANGFUSE_PI_PARENT_SESSION_ID: "sess-app",
+    });
+    assert.equal(parent?.spanContext.traceId, traceId);
+    assert.equal(parent?.spanContext.spanId, spanId);
+    assert.equal(parent?.spanContext.isRemote, true);
+    assert.equal(parent?.sessionId, "sess-app");
+  });
+
+  it("resolves parent source and trace ownership per input shape", () => {
+    const pair = { LANGFUSE_PI_PARENT_TRACE_ID: traceId, LANGFUSE_PI_PARENT_SPAN_ID: spanId };
+    const tp = { LANGFUSE_PI_TRACEPARENT: `00-${traceId}-${spanId}-01` };
+    const cases: Array<[string, NodeJS.ProcessEnv, "subagent" | "attached", boolean]> = [
+      ["the id pair is what publishParentContext writes", pair, "subagent", false],
+      ["a traceparent can only come from outside pi", tp, "attached", true],
+      ["a malformed traceparent still falls back to the pair", { ...pair, LANGFUSE_PI_TRACEPARENT: "junk" }, "subagent", false],
+      ["a subagent inherits external ownership without becoming attached", { ...pair, LANGFUSE_PI_PARENT_EXTERNAL_TRACE: "1" }, "subagent", true],
+      ["and an explicit 0 does not claim it", { ...pair, LANGFUSE_PI_PARENT_EXTERNAL_TRACE: "0" }, "subagent", false],
+    ];
+    for (const [why, env, source, externalTrace] of cases) {
+      const parent = readInheritedParent(env);
+      assert.equal(parent?.source, source, why);
+      assert.equal(parent?.externalTrace, externalTrace, why);
+    }
+  });
+
+  it("lets the traceparent win over the explicit pair", () => {
+    const other = "1111111111111111111111111111111a";
+    const parent = readInheritedParent({
+      LANGFUSE_PI_TRACEPARENT: `00-${traceId}-${spanId}-01`,
+      LANGFUSE_PI_PARENT_TRACE_ID: other,
+      LANGFUSE_PI_PARENT_SPAN_ID: "cccccccccccccccc",
+    });
+    assert.equal(parent?.spanContext.traceId, traceId);
+    assert.equal(parent?.spanContext.spanId, spanId);
+  });
+
+  it("falls back to the pair when the traceparent is malformed", () => {
+    const parent = readInheritedParent({
+      LANGFUSE_PI_TRACEPARENT: "not-a-traceparent",
+      LANGFUSE_PI_PARENT_TRACE_ID: traceId,
+      LANGFUSE_PI_PARENT_SPAN_ID: spanId,
+    });
+    assert.equal(parent?.spanContext.traceId, traceId);
+    assert.equal(parent?.spanContext.spanId, spanId);
+  });
+
+  it("ignores a bare TRACEPARENT, which an instrumented parent exports at us", () => {
+    assert.equal(readInheritedParent({ TRACEPARENT: `00-${traceId}-${spanId}-01` }), undefined);
+    assert.equal(readInheritedParent({ traceparent: `00-${traceId}-${spanId}-01` }), undefined);
+  });
+});
+
+describe("parseTraceparent", () => {
+  const traceId = "0af7651916cd43dd8448eb211c80319c";
+  const spanId = "b7ad6b7169203331";
+
+  it("parses the version-00 form, trimmed and case-folded", () => {
+    assert.deepEqual(parseTraceparent(`00-${traceId}-${spanId}-01`), { traceId, spanId });
+    assert.deepEqual(parseTraceparent(`  00-${traceId.toUpperCase()}-${spanId.toUpperCase()}-01  `), {
+      traceId,
+      spanId,
+    });
+  });
+
+  it("is a tolerant reader on the flags, so an unsampled launcher span still nests", () => {
+    assert.deepEqual(parseTraceparent(`00-${traceId}-${spanId}-00`), { traceId, spanId });
+  });
+
+  it("accepts a future version and ignores the fields it appends", () => {
+    for (const header of [
+      `01-${traceId}-${spanId}-01`,
+      `cc-${traceId}-${spanId}-01`,
+      `01-${traceId}-${spanId}-01-somethingnew`,
+      `02-${traceId}-${spanId}-01-a-b-c`,
+    ]) {
+      assert.deepEqual(parseTraceparent(header), { traceId, spanId }, header);
+    }
+  });
+
+  it("still rejects trailing fields at version 00, which defines exactly four", () => {
+    assert.equal(parseTraceparent(`00-${traceId}-${spanId}-01-extra`), undefined);
+  });
+
+  it("refuses version ff, which the spec forbids", () => {
+    assert.equal(parseTraceparent(`ff-${traceId}-${spanId}-01`), undefined);
+    assert.equal(parseTraceparent(`FF-${traceId}-${spanId}-01`), undefined);
+  });
+
+
+  it("rejects the all-zero ids an idle OTel launcher emits", () => {
+    assert.equal(parseTraceparent(`00-${"0".repeat(32)}-${spanId}-01`), undefined);
+    assert.equal(parseTraceparent(`00-${traceId}-${"0".repeat(16)}-01`), undefined);
+  });
+
+  it("rejects junk without throwing", () => {
+    for (const bad of [
+      "",
+      "-",
+      "not-a-traceparent",
+      `00-${traceId}-${spanId}`,
+      `00-${traceId}-${spanId}-01-extra`,
+      `00-xyz-${spanId}-01`,
+      `00-${traceId}-short-01`,
+      `00-${traceId.slice(0, 31)}-${spanId}-01`,
+      `0-${traceId}-${spanId}-01`,
+    ]) {
+      assert.equal(parseTraceparent(bad), undefined, `must reject ${JSON.stringify(bad)}`);
+    }
   });
 });
 
