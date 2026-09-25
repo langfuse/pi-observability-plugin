@@ -98,6 +98,8 @@ function streamChunks(
 /** Usage the mock reports for a compaction/branch summarization call. */
 export const SUMMARIZATION_USAGE = { prompt: 3571, completion: 313 };
 
+export const MOCK_SUMMARY_TEXT = "Summary of the earlier work.";
+
 export const FINAL_ANSWER_THINKING =
   "The workspace holds a single README, so a one-line summary answers the prompt.";
 
@@ -136,13 +138,21 @@ export function startMockProvider(): Promise<MockProvider> {
         completion_tokens_details: { reasoning_tokens: reasoning },
       });
 
-      // Both compaction paths wrap the history in <conversation> tags before
-      // calling completeSummarization, which bypasses the agent loop.
-      if (JSON.stringify(messages).includes("<conversation>")) {
+      if ((payload.tools ?? []).length === 0) {
         streamChunks(res, model, {
           text: "Summary of the earlier work.",
           finish: "stop",
           usage: usage(SUMMARIZATION_USAGE.prompt, SUMMARIZATION_USAGE.completion, 0),
+        });
+        return;
+      }
+
+      if (JSON.stringify(messages).includes(MOCK_SUMMARY_TEXT)) {
+        streamChunks(res, model, {
+          thinking: FINAL_ANSWER_THINKING,
+          text: "This is the test workspace. Done.",
+          finish: "stop",
+          usage: usage(1600, 78, 1280, 30),
         });
         return;
       }

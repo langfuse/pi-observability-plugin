@@ -462,6 +462,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
   // agent loop, so no message_end fires — yet pi still books the tokens.
   it("traces the compaction summarization call so the session total matches pi", async () => {
     const capture = await startCaptureServer();
+    const callsBefore = mock.payloads().length;
     try {
       const sandbox = createSandbox(mock.port, {
         contextWindow: 18000, // minus reserveTokens 16384 -> threshold 1616
@@ -475,8 +476,17 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       await waitForRequests(capture, 1);
       const spans = capture.spans();
 
+      const summarizationCalls = mock
+        .payloads()
+        .slice(callsBefore)
+        .filter((p) => ((p.tools as unknown[] | undefined) ?? []).length === 0).length;
       const compactions = findSpansByName(spans, "Compaction");
-      assert.equal(compactions.length, 1, "the compaction summarization call must be traced");
+      assert.ok(summarizationCalls > 0, "pi must have run a compaction summarization");
+      assert.equal(
+        compactions.length,
+        summarizationCalls,
+        "every compaction summarization call must be traced exactly once",
+      );
       const compaction = compactions[0]!;
       assert.equal(compaction.attrs["langfuse.observation.type"], "generation");
 
