@@ -953,7 +953,12 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_update", (event) => {
     const gen = state?.openGeneration;
     if (!gen || gen.finished || gen.sawFirstToken) return;
-    if (extractText((event.message as { content?: unknown })?.content).length > 0) {
+    const content = (event.message as { content?: unknown })?.content;
+    if (
+      extractText(content).length > 0 ||
+      extractThinking(content).length > 0 ||
+      extractToolCalls(content).length > 0
+    ) {
       gen.sawFirstToken = true;
       gen.obs.update({ completionStartTime: new Date() });
     }

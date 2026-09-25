@@ -4,8 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
-  # pi releases several minor versions each week, so a failure can appear
-  # without pull request activity.
+  # pi releases several minor versions each week, so a failure can appear without pull request activity.
   schedule:
     - cron: "23 3 * * *"
   workflow_dispatch:
@@ -57,6 +56,8 @@ jobs:
         # Therefore it uses `latest` only, and it omits the fixed versions.
         node: ${{ github.event_name == 'schedule' && fromJSON('[22]') || fromJSON('[22, 24]') }}
         pi-version: ${{ github.event_name == 'schedule' && fromJSON('["latest"]') || fromJSON('["", "0.83.0", "0.84.1", "latest"]') }}
+    # Reports without gating a pull request; the scheduled run still fails hard. LFE-16666.
+    continue-on-error: ${{ matrix.pi-version == 'latest' && github.event_name != 'schedule' }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
