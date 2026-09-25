@@ -233,7 +233,6 @@ export interface Capture {
   port: number;
   requests: unknown[];
   spans: () => CapturedSpan[];
-  /** Attributes of the OTLP resource the exported spans were sent under. */
   resourceAttrs: () => Record<string, unknown>;
   close: () => void;
 }
@@ -328,7 +327,6 @@ export interface Sandbox {
 export interface SandboxOptions {
   contextWindow?: number;
   keepRecentTokens?: number;
-  /** Pads README.md so reading it grows the context past keepRecentTokens. */
   readmeFillerLines?: number;
 }
 
@@ -388,7 +386,6 @@ export function runPi(
   opts: {
     continue?: boolean;
     env?: Record<string, string | undefined>;
-    /** More extensions to load with ours, for example the subagent fixture. */
     extensions?: string[];
   } = {},
 ): Promise<{ status: number | null; stdout: string; stderr: string }> {
@@ -409,7 +406,6 @@ export function runPi(
   return new Promise((resolvePromise) => {
     const child = spawn(PI_BIN, args, {
       cwd: sandbox.workspace,
-      // stdin must be closed — pi's print mode waits for EOF on piped stdin.
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
@@ -424,15 +420,15 @@ export function runPi(
         LANGFUSE_TRACING_ENVIRONMENT: undefined,
         LANGFUSE_RELEASE: undefined,
         LANGFUSE_TRACING_ENABLED: undefined,
-        // These feed the exported OTel resource, so the runner's own
-        // environment must not reach the span payload either.
         OTEL_SERVICE_NAME: undefined,
         OTEL_RESOURCE_ATTRIBUTES: undefined,
         // A test run must not get a parent trace from this test process.
+        LANGFUSE_PI_TRACEPARENT: undefined,
         LANGFUSE_PI_PARENT_TRACE_ID: undefined,
         LANGFUSE_PI_PARENT_SPAN_ID: undefined,
         LANGFUSE_PI_PARENT_SESSION_ID: undefined,
         LANGFUSE_PI_PARENT_DEPTH: undefined,
+        LANGFUSE_PI_PARENT_EXTERNAL_TRACE: undefined,
         // The subagent fixture uses these values.
         TEST_PI_BIN: PI_BIN,
         TEST_LANGFUSE_EXTENSION: EXTENSION,
@@ -458,7 +454,6 @@ export function runPi(
   });
 }
 
-/** Poll until the capture holds at least `n` export requests (flushes are async). */
 export async function waitForRequests(capture: Capture, n: number, timeoutMs = 5000): Promise<void> {
   const start = Date.now();
   while (capture.requests.length < n && Date.now() - start < timeoutMs) {

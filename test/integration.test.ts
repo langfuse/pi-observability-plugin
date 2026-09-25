@@ -326,7 +326,10 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       const sandbox = createSandbox(mock.port);
       const result = await runPi(sandbox, "Delegate the repo inspection, then summarize", {
         env: buildLangfuseEnv(capture),
-        extensions: [join(REPO_ROOT, "test", "fixtures", "subagent-tool.ts")],
+        extensions: [
+          join(REPO_ROOT, "test", "fixtures", "subagent-tool.ts"),
+          join(REPO_ROOT, "test", "fixtures", "env-probe.ts"),
+        ],
       });
       assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
       // The parent and the child export separately. Wait for the two exports.
@@ -430,6 +433,158 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       // when it prints at agent_settled.
       assert.match(result.stderr, /PROBE turn [0-9a-f]{32}/, "parent ids must be published during the turn");
       assert.match(result.stderr, /PROBE settled <unset>/, "parent ids must be withdrawn after the turn");
+      assert.match(
+        result.stderr,
+        /PROBE turn-ext <unset>/,
+        "a standalone run owns its trace, so nothing marks it as externally owned",
+      );
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("attaches every turn under an external traceparent", async () => {
+    const capture = await startCaptureServer();
+    const appTraceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const appSpanId = "00f067aa0ba902b7";
+    try {
+      const sandbox = createSandbox(mock.port);
+      const result = await runPi(sandbox, "Explore this project and summarize it", {
+        env: {
+          ...buildLangfuseEnv(capture),
+          LANGFUSE_PI_TRACEPARENT: `00-${appTraceId}-${appSpanId}-01`,
+        },
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+
+      const spans = capture.spans();
+      const root = findSpansByName(spans, "Conversational Turn")[0];
+      assert.ok(root, "expected a turn root span");
+      assert.equal(root!.traceId, appTraceId, "the turn must join the application's trace");
+      assert.equal(root!.parentSpanId, appSpanId, "the turn must nest under the application's span");
+
+      assert.equal(
+        findSpansByName(spans, "Subagent Turn").length,
+        0,
+        "an attached run must not be labelled a subagent",
+      );
+      assert.equal(
+        root!.attrs["langfuse.observation.metadata.pi_subagent"],
+        undefined,
+        "an attached run must not carry subagent metadata",
+      );
+      assert.equal(
+        String(root!.attrs["langfuse.observation.metadata.attached_to_external_parent"]),
+        "true",
+      );
+
+      for (const [attr, why] of [
+        ["langfuse.trace.name", "must not overwrite the application's trace name"],
+        ["session.id", "must not claim the application's session"],
+        ["langfuse.trace.tags", "must not add pi's tags to the application's trace"],
+        ["user.id", "must not set the user on the application's trace"],
+      ] as const) {
+        for (const span of spans) {
+          assert.equal(span.attrs[attr], undefined, `${span.name} ${why}`);
+        }
+      }
+      assert.ok(
+        root!.attrs["langfuse.observation.metadata.session_id"],
+        "pi's own session id stays readable in the observation metadata",
+      );
+
+      for (const span of spans) {
+        assert.equal(span.traceId, appTraceId, `${span.name} must be in the application's trace`);
+      }
+      assert.ok(
+        spans.some((s) => s.name === "LLM Call"),
+        "the generations must still be traced in attached mode",
+      );
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("falls back to its own trace when the traceparent is unusable", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const result = await runPi(sandbox, "Explore this project and summarize it", {
+        env: {
+          ...buildLangfuseEnv(capture),
+          LANGFUSE_PI_TRACEPARENT: `00-${"0".repeat(32)}-${"0".repeat(16)}-01`,
+        },
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+
+      const root = findSpansByName(capture.spans(), "Conversational Turn")[0];
+      assert.ok(root, "expected a turn root span");
+      assert.equal(root!.parentSpanId, undefined, "the turn must be its own root");
+      assert.notEqual(root!.traceId, "0".repeat(32), "the all-zero trace id must never be adopted");
+      assert.ok(root!.attrs["langfuse.trace.name"], "a standalone turn still owns its trace name");
+      assert.match(result.stderr, /Ignoring malformed LANGFUSE_PI_TRACEPARENT/);
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("nests a subagent of an attached run under the turn and off the application's trace fields", async () => {
+    const capture = await startCaptureServer();
+    const appTraceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const appSpanId = "00f067aa0ba902b7";
+    try {
+      const sandbox = createSandbox(mock.port);
+      const result = await runPi(sandbox, "Delegate the repo inspection, then summarize", {
+        env: {
+          ...buildLangfuseEnv(capture),
+          LANGFUSE_PI_TRACEPARENT: `00-${appTraceId}-${appSpanId}-01`,
+        },
+        extensions: [
+          join(REPO_ROOT, "test", "fixtures", "subagent-tool.ts"),
+          join(REPO_ROOT, "test", "fixtures", "env-probe.ts"),
+        ],
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+      await waitForRequests(capture, 2, 15_000);
+      const spans = capture.spans();
+
+      assert.match(
+        result.stderr,
+        /PROBE turn-tp <unset>/,
+        "the inherited traceparent must be out of the child's way while a turn is published",
+      );
+      assert.match(
+        result.stderr,
+        new RegExp(`PROBE settled-tp 00-${appTraceId}-${appSpanId}-01`),
+        "and must be restored afterwards, since the application's span is still valid",
+      );
+      assert.match(
+        result.stderr,
+        /PROBE turn-ext 1/,
+        "external ownership must be published for the child to inherit",
+      );
+
+      const parentRoot = findSpansByName(spans, "Conversational Turn")[0];
+      const subagentRoot = findSpansByName(spans, "Subagent Turn")[0];
+      assert.ok(parentRoot, "parent turn must be traced");
+      assert.ok(subagentRoot, "the subagent must still be a Subagent Turn, not a second top-level turn");
+      assert.equal(subagentRoot!.parentSpanId, parentRoot!.spanId, "the subagent belongs under the turn");
+      assert.equal(
+        String(subagentRoot!.attrs["langfuse.observation.metadata.pi_subagent"]),
+        "true",
+        "and keeps its subagent metadata",
+      );
+
+      for (const span of spans) {
+        assert.equal(span.traceId, appTraceId, `${span.name} must be in the application's trace`);
+        for (const attr of ["langfuse.trace.name", "session.id", "langfuse.trace.tags", "user.id"] as const) {
+          assert.equal(
+            span.attrs[attr],
+            undefined,
+            `${span.name} must not set ${attr} on a trace the application owns`,
+          );
+        }
+      }
     } finally {
       capture.close();
     }
