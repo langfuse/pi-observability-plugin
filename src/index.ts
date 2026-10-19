@@ -125,7 +125,7 @@ export function loadConfig(): LangfuseConfig | undefined {
   if ((process.env.LANGFUSE_TRACING_ENABLED ?? "").trim().toLowerCase() === "false") {
     return undefined;
   }
-  const file = readConfigFile();
+  const file = process.env.PI_LANGFUSE_USE_EXISTING_TRACER_PROVIDER === "true" ? {} : readConfigFile();
   const asTrimmedString = (v: unknown): string | undefined =>
     typeof v === "string" && v.trim() ? v.trim() : undefined;
 
@@ -675,6 +675,7 @@ const debug = (...args: unknown[]) => {
 
 export default function (pi: ExtensionAPI) {
   debug("factory start");
+  const managed = process.env.PI_LANGFUSE_USE_EXISTING_TRACER_PROVIDER === "true";
   const config = loadConfig();
   if (!config) {
     pi.on("session_start", (_event, ctx) => {
@@ -694,7 +695,7 @@ export default function (pi: ExtensionAPI) {
   let lastPromptText = "";
   let lastContextHistory: ChatMlMessage[] | undefined;
   let compactionStartedAt: Date | undefined;
-  const inheritedParent = readInheritedParent();
+  const inheritedParent = managed ? undefined : readInheritedParent();
   const isAttached = inheritedParent?.source === "attached";
   const externalTrace = inheritedParent?.externalTrace ?? false;
   const inheritedParentEnv: Record<string, string | undefined> = {
@@ -706,7 +707,8 @@ export default function (pi: ExtensionAPI) {
     [ENV_PARENT_EXTERNAL_TRACE]: process.env[ENV_PARENT_EXTERNAL_TRACE],
   };
 
-  const ensureRuntime = (): Runtime => {
+  const ensureRuntime = (): Runtime | undefined => {
+    if (managed) return undefined;
     if (!runtime || runtime.shutdown) runtime = createRuntime(config, () => traceAttributes);
     return runtime;
   };
@@ -752,6 +754,7 @@ export default function (pi: ExtensionAPI) {
   // The turn root is the parent for subagents. pi runs tool calls in parallel,
   // so one global variable cannot point to one of many tool spans.
   const publishParentContext = (root: LangfuseSpan, sessionId: string) => {
+    if (managed) return;
     const ctx = root.otelSpan.spanContext();
     // Do not publish a root that the sampler dropped. Child spans would point
     // to a trace with no exported root.
@@ -768,6 +771,7 @@ export default function (pi: ExtensionAPI) {
   // A child must not attach to a turn that has ended. The inherited values
   // stay valid, so put them back instead of a plain delete.
   const withdrawParentContext = () => {
+    if (managed) return;
     for (const [key, value] of Object.entries(inheritedParentEnv)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;

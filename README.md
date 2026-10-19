@@ -78,6 +78,13 @@ export LANGFUSE_USER_ID="your-user-id"
 Environment variables take precedence over the config file, so you can override
 a single value without editing the file.
 
+If your application already creates a Langfuse tracer provider, set
+`PI_LANGFUSE_USE_EXISTING_TRACER_PROVIDER=true` before it loads this extension.
+The extension then uses that provider. It does not create an exporter, read
+`langfuse.json`, or change the parent trace environment variables. Set the
+Langfuse keys as environment variables so the extension can enable itself.
+The application owns provider flush and shutdown.
+
 ## Environment variables
 
 | Variable                       | Description                                                                                                                                       | Required            |

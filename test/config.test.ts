@@ -14,6 +14,7 @@ const CONFIG_VARS = [
   "LANGFUSE_TRACING_ENVIRONMENT",
   "LANGFUSE_RELEASE",
   "LANGFUSE_TRACING_ENABLED",
+  "PI_LANGFUSE_USE_EXISTING_TRACER_PROVIDER",
   "PI_CODING_AGENT_DIR",
 ];
 
@@ -68,6 +69,16 @@ describe("loadConfig", () => {
     assert.equal(config?.publicKey, "pk-lf-env");
     assert.equal(config?.secretKey, "sk-lf-file"); // not overridden -> file value
     assert.equal(config?.userId, "env-user");
+  });
+
+  it("does not read a plugin config file when the host owns tracing", () => {
+    writeConfigFile({ publicKey: "pk-lf-file", secretKey: "sk-lf-file", userId: "file-user" });
+    process.env.PI_LANGFUSE_USE_EXISTING_TRACER_PROVIDER = "true";
+    assert.equal(loadConfig(), undefined);
+    process.env.LANGFUSE_PUBLIC_KEY = "pk-lf-env";
+    process.env.LANGFUSE_SECRET_KEY = "sk-lf-env";
+    assert.equal(loadConfig()?.publicKey, "pk-lf-env");
+    assert.equal(loadConfig()?.userId, undefined);
   });
 
   it("supports LANGFUSE_HOST as baseUrl alias", () => {
