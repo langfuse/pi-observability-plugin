@@ -1,7 +1,4 @@
 rules:
   adhoc-packages:
     ignore:
-      # The CI matrix jobs install pi with npm into $RUNNER_TEMP. The lock file
-      # does not control this installation, because the tests run the real pi
-      # program. npm uses pi's npm-shrinkwrap.json file, but pnpm does not.
       - ci.yml
