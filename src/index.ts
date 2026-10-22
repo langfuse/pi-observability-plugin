@@ -64,9 +64,8 @@ interface InProcessParent {
   depth: number;
   externalTrace: boolean;
 }
-const IN_PROCESS_PARENTS: Map<string, InProcessParent> = ((globalThis as Record<symbol, unknown>)[
-  Symbol.for("langfuse.pi.inProcessParents")
-] ??= new Map<string, InProcessParent>()) as Map<string, InProcessParent>;
+const globalSlots = globalThis as Record<symbol, Map<string, InProcessParent> | undefined>;
+const IN_PROCESS_PARENTS = (globalSlots[Symbol.for("langfuse.pi.inProcessParents")] ??= new Map<string, InProcessParent>());
 
 function lookupInProcessParent(parentSession: string): InheritedParent | undefined {
   const entry = IN_PROCESS_PARENTS.get(parentSession);

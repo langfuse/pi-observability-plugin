@@ -25,7 +25,6 @@ function buildLangfuseEnv(capture: Capture): Record<string, string> {
     LANGFUSE_PUBLIC_KEY: "pk-lf-test",
     LANGFUSE_SECRET_KEY: "sk-lf-test",
     LANGFUSE_BASE_URL: `http://127.0.0.1:${capture.port}`,
-    LANGFUSE_USER_ID: "test-user",
   };
 }
 
@@ -33,7 +32,7 @@ function findSpansByName(spans: CapturedSpan[], name: string): CapturedSpan[] {
   return spans.filter((s) => s.name === name);
 }
 
-describe("in-process subagent disposal", () => {
+describe("integration: in-process subagents", () => {
   let mock: MockProvider;
 
   before(async () => {
