@@ -48,7 +48,8 @@ pi -e npm:@langfuse/pi-observability-plugin
 
 ## Add your Langfuse credentials
 
-Create a credentials file at `~/.pi/agent/langfuse.json`:
+Create a credentials file at `.pi/langfuse.json` in your project's working
+directory, or at `~/.pi/agent/langfuse.json` for a global default:
 
 ```json
 {
@@ -64,6 +65,13 @@ Only `publicKey` and `secretKey` are required. If `baseUrl` is omitted, the
 plugin uses `https://cloud.langfuse.com` (EU region). `userId`, `environment`
 and `release` are optional labels that let you segment traces by teammate, stage
 or version. Keep the file private, because it holds a secret key.
+Add `.pi/langfuse.json` to your project's `.gitignore` to avoid committing credentials.
+
+The plugin checks the current working directory's `.pi/langfuse.json` first.
+If it is missing, unreadable, or does not contain a JSON object, it falls back
+to the global file (`PI_CODING_AGENT_DIR/langfuse.json` when that variable is set).
+The files are not merged: a valid project object completely replaces the global
+config, even if it is empty or missing keys. Parent directories are not searched.
 
 Alternatively, set your credentials with environment variables:
 
@@ -102,7 +110,8 @@ a single value without editing the file.
 The kill switch has priority over environment keys and the config file. When
 tracing is off, the status line shows `langfuse: off (no keys)` and nothing is
 sent. This message reads the same whether the kill switch is set or the keys are
-genuinely missing. To remove stored keys, delete `~/.pi/agent/langfuse.json`.
+genuinely missing. To remove stored keys, delete them from `.pi/langfuse.json`
+and/or `~/.pi/agent/langfuse.json`, wherever you configured them.
 
 `pi remove` needs the same source you installed from. For a local checkout, see
 [Development](#development).
