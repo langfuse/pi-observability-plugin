@@ -925,6 +925,47 @@ describe("integration: pi -> extension -> Langfuse export", () => {
     }
   });
 
+  it("traces a run that an extension starts with sendMessage({ triggerTurn: true })", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const result = await runPi(sandbox, "Explore this project and summarize it", {
+        env: buildLangfuseEnv(capture),
+        extensions: [join(REPO_ROOT, "test", "fixtures", "trigger-turn.ts")],
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+      await waitForRequests(capture, 2);
+      const spans = capture.spans();
+
+      const roots = byStart(findSpansByName(spans, "Conversational Turn"));
+      assert.equal(roots.length, 2, "the triggered run must get its own root");
+      const [prompted, triggered] = roots as [CapturedSpan, CapturedSpan];
+      assert.notEqual(prompted.traceId, triggered.traceId, "each run is its own trace");
+      assert.equal(triggered.parentSpanId, undefined);
+      assert.equal(triggered.attrs["langfuse.trace.name"], "Pi Turn");
+      assert.equal(triggered.attrs["session.id"], prompted.attrs["session.id"], "same pi session");
+      assert.equal(triggered.attrs["langfuse.observation.metadata.triggered_by"], "custom_message");
+      assert.deepEqual(inputOf(triggered), [
+        { role: "user", content: "External trigger: summarize the workspace" },
+      ]);
+      assert.equal(outputOf(triggered).content, "This is the test workspace. Done.");
+
+      const tree = spans.filter((s) => s.traceId === triggered.traceId);
+      const generations = findSpansByName(tree, "LLM Call");
+      const tools = tree.filter((s) => s.name.startsWith("Tool: "));
+      assert.equal(generations.length, 3, "every model call of the triggered run is traced");
+      assert.deepEqual(tools.map((t) => t.name).sort(), ["Tool: bash", "Tool: read"]);
+      for (const child of [...generations, ...tools]) {
+        assert.equal(child.parentSpanId, triggered.spanId, `${child.name} must be a direct child of the root`);
+      }
+      for (const generation of generations) {
+        assert.ok(generation.attrs["langfuse.observation.usage_details"], "usage must be traced");
+      }
+    } finally {
+      capture.close();
+    }
+  });
+
   it("times the first token when reasoning arrives before any text", async () => {
     const capture = await startCaptureServer();
     try {

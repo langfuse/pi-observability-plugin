@@ -656,7 +656,7 @@ interface OpenGeneration {
 
 interface PromptState {
   root: LangfuseSpan;
-  turnNumber: number;
+  turnNumber?: number;
   generationCount: number;
   openGeneration?: OpenGeneration;
   openTools: Map<string, { obs: LangfuseTool; name: string; startedAt: Date }>;
@@ -666,6 +666,7 @@ interface PromptState {
   userText: string;
   turnImages: PiImagePart[];
   systemPrompt?: string;
+  triggeredBy?: "custom_message";
 }
 
 const DEBUG = process.env.PI_LANGFUSE_DEBUG === "true";
@@ -834,16 +835,26 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("before_agent_start", (event, ctx) => {
-    debug("before_agent_start");
+  const openRoot = (
+    ctx: ExtensionContext,
+    turn:
+      | { prompt: string; images: PiImagePart[] }
+      // pi starts this run without before_agent_start, so there is no prompt
+      // yet; message_end fills the input from the custom message.
+      | { triggeredBy: "custom_message" },
+  ) => {
     ensureRuntime();
-    debug("runtime ready"); 
+    debug("runtime ready");
     if (state) finalizeRoot({ cancelled: true });
 
     const sessionId = ctx.sessionManager.getSessionId();
-    const turnNumber = resolveTurnNumber(ctx, event.prompt);
-    const promptImages = extractImages(event.images);
-    const userText = [event.prompt, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
+    const triggeredBy = "triggeredBy" in turn ? turn.triggeredBy : undefined;
+    // A triggered run is not a user prompt, so it takes no turn number.
+    const turnNumber = "prompt" in turn ? resolveTurnNumber(ctx, turn.prompt) : undefined;
+    const promptImages = "images" in turn ? turn.images : [];
+    const userText = "prompt" in turn
+      ? [turn.prompt, ...promptImages.map(describeImage)].filter(Boolean).join("\n")
+      : "";
     lastPromptText = userText;
     lastContextHistory = undefined;
     const isSubagent = inheritedParent?.source === "subagent";
@@ -861,13 +872,14 @@ export default function (pi: ExtensionAPI) {
     const root = startObservation(
       isSubagent ? SUBAGENT_ROOT_OBSERVATION_NAME : ROOT_OBSERVATION_NAME,
       {
-        input: { role: "user", content: userText },
+        input: userText ? { role: "user", content: userText } : undefined,
         metadata: {
           source: "pi",
           extension: EXTENSION_NAME,
           extension_version: EXTENSION_VERSION,
           session_id: sessionId,
-          turn_number: turnNumber,
+          ...(turnNumber !== undefined ? { turn_number: turnNumber } : {}),
+          ...(triggeredBy ? { triggered_by: triggeredBy } : {}),
           cwd: ctx.cwd,
           ...(gitBranch ? { git_branch: gitBranch } : {}),
           ...(ctx.model ? { model: ctx.model.id, provider: ctx.model.provider } : {}),
@@ -880,7 +892,7 @@ export default function (pi: ExtensionAPI) {
       { asType: "span", ...(inheritedParent ? { parentSpanContext: inheritedParent.spanContext } : {}) },
     );
 
-    state = {
+    const opened: PromptState = {
       root,
       turnNumber,
       generationCount: 0,
@@ -889,9 +901,17 @@ export default function (pi: ExtensionAPI) {
       sawError: false,
       userText,
       turnImages: [...promptImages],
+      triggeredBy,
     };
+    state = opened;
     publishParentContext(root, sessionId);
-    debug("root created, turn", turnNumber);
+    debug("root created, turn", turnNumber ?? triggeredBy);
+    return opened;
+  };
+
+  pi.on("before_agent_start", (event, ctx) => {
+    debug("before_agent_start");
+    openRoot(ctx, { prompt: event.prompt, images: extractImages(event.images) });
   });
 
   pi.on("context", (event) => {
@@ -900,12 +920,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", (_event, ctx) => {
-    if (!state) return;
+    // sendMessage({ triggerTurn: true }) on an idle session runs the agent
+    // without before_agent_start.
+    const current = state ?? openRoot(ctx, { triggeredBy: "custom_message" });
     const systemPrompt = readSystemPrompt(ctx);
     if (!systemPrompt) return;
-    state.systemPrompt = systemPrompt;
+    current.systemPrompt = systemPrompt;
     try {
-      state.root.update({ metadata: { system_prompt: systemPrompt } });
+      current.root.update({ metadata: { system_prompt: systemPrompt } });
     } catch {}
     debug("system prompt captured", systemPrompt.length);
   });
@@ -978,6 +1000,15 @@ export default function (pi: ExtensionAPI) {
       errorMessage?: string;
       usage?: PiUsage;
     };
+    if (message.role === "custom" && state.triggeredBy && !state.userText) {
+      const userText = renderContentWithImageMarkers(message.content);
+      if (userText) {
+        state.userText = userText;
+        lastPromptText = userText;
+        state.root.update({ input: { role: "user", content: userText } });
+      }
+      return;
+    }
     if (message.role !== "assistant") return;
     const gen = state.openGeneration;
     if (!gen || gen.finished) return;
