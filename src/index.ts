@@ -49,6 +49,38 @@ const ENV_PARENT_EXTERNAL_TRACE = "LANGFUSE_PI_PARENT_EXTERNAL_TRACE";
 const HEX_TRACE_ID = /^[0-9a-f]{32}$/;
 const HEX_SPAN_ID = /^[0-9a-f]{16}$/;
 
+// Active turn roots of the sessions in this process. An in-process subagent
+// (a second AgentSession in the same process) finds its parent turn here
+// through the parentSession of its session header. The env handoff cannot do
+// this: process.env is shared, so it holds whichever turn published last,
+// e.g. a sibling subagent. Keyed by session id and by session file, because pi
+// writes the parent's file path into the header and orchestrators may write
+// the parent's session id. Kept on globalThis, like the tracer slot of
+// @langfuse/tracing, so sessions that load their own copy of this module
+// still share it.
+interface InProcessParent {
+  root: LangfuseSpan;
+  sessionId: string;
+  depth: number;
+  externalTrace: boolean;
+}
+const globalSlots = globalThis as Record<symbol, Map<string, InProcessParent> | undefined>;
+const IN_PROCESS_PARENTS = (globalSlots[Symbol.for("langfuse.pi.inProcessParents")] ??= new Map<string, InProcessParent>());
+
+function lookupInProcessParent(parentSession: string): InheritedParent | undefined {
+  const entry = IN_PROCESS_PARENTS.get(parentSession);
+  if (!entry) return undefined;
+  const spanContext = entry.root.otelSpan.spanContext();
+  if (!(spanContext.traceFlags & TraceFlags.SAMPLED)) return undefined;
+  return {
+    spanContext,
+    sessionId: entry.sessionId,
+    depth: entry.depth + 1,
+    source: "subagent",
+    externalTrace: entry.externalTrace,
+  };
+}
+
 const isUsableTraceId = (v: string | undefined): v is string =>
   !!v && HEX_TRACE_ID.test(v) && !/^0+$/.test(v);
 const isUsableSpanId = (v: string | undefined): v is string =>
@@ -606,6 +638,17 @@ interface Runtime {
   shutdown: boolean;
 }
 
+/**
+ * @langfuse/tracing resolves its tracer from one process-global slot, and every
+ * session in the process (a parent plus its in-process subagents) owns its own
+ * provider. Point the slot at this session's provider right before each
+ * synchronous startObservation call, so a span never lands on another
+ * session's provider, which that session may already have shut down.
+ */
+function bindProvider(runtime: Runtime): void {
+  setLangfuseTracerProvider(runtime.provider);
+}
+
 function isLangfuseSpan(span: { attributes: Record<string, unknown> }): boolean {
   const observationType = span.attributes["langfuse.observation.type"];
   return typeof observationType === "string";
@@ -639,7 +682,8 @@ function createRuntime(
     sampler: new AlwaysOnSampler(),
     spanLimits: { attributeValueLengthLimit: Infinity, attributeCountLimit: Infinity },
   });
-  setLangfuseTracerProvider(provider);
+  // No setLangfuseTracerProvider here: bindProvider() points the global slot
+  // at this provider before each span start.
   return { processor, provider, shutdown: false };
 }
 
@@ -656,6 +700,8 @@ interface OpenGeneration {
 
 interface PromptState {
   root: LangfuseSpan;
+  /** Keys this turn is registered under in IN_PROCESS_PARENTS. */
+  registryKeys: string[];
   turnNumber: number;
   generationCount: number;
   openGeneration?: OpenGeneration;
@@ -751,7 +797,7 @@ export default function (pi: ExtensionAPI) {
 
   // The turn root is the parent for subagents. pi runs tool calls in parallel,
   // so one global variable cannot point to one of many tool spans.
-  const publishParentContext = (root: LangfuseSpan, sessionId: string) => {
+  const publishParentContext = (root: LangfuseSpan, sessionId: string, depth: number, turnExternalTrace: boolean) => {
     const ctx = root.otelSpan.spanContext();
     // Do not publish a root that the sampler dropped. Child spans would point
     // to a trace with no exported root.
@@ -760,8 +806,8 @@ export default function (pi: ExtensionAPI) {
     process.env[ENV_PARENT_TRACE_ID] = ctx.traceId;
     process.env[ENV_PARENT_SPAN_ID] = ctx.spanId;
     process.env[ENV_PARENT_SESSION_ID] = sessionId;
-    process.env[ENV_PARENT_DEPTH] = String((inheritedParent?.depth ?? 0) + 1);
-    if (externalTrace) process.env[ENV_PARENT_EXTERNAL_TRACE] = "1";
+    process.env[ENV_PARENT_DEPTH] = String(depth + 1);
+    if (turnExternalTrace) process.env[ENV_PARENT_EXTERNAL_TRACE] = "1";
     else delete process.env[ENV_PARENT_EXTERNAL_TRACE];
   };
 
@@ -790,6 +836,9 @@ export default function (pi: ExtensionAPI) {
     });
     state.root.end();
     withdrawParentContext();
+    for (const key of state.registryKeys) {
+      if (IN_PROCESS_PARENTS.get(key)?.root === state.root) IN_PROCESS_PARENTS.delete(key);
+    }
     state = undefined;
   };
 
@@ -836,28 +885,35 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", (event, ctx) => {
     debug("before_agent_start");
-    ensureRuntime();
+    const sessionId = ctx.sessionManager.getSessionId();
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    const rt = ensureRuntime();
     debug("runtime ready"); 
     if (state) finalizeRoot({ cancelled: true });
-
-    const sessionId = ctx.sessionManager.getSessionId();
     const turnNumber = resolveTurnNumber(ctx, event.prompt);
     const promptImages = extractImages(event.images);
     const userText = [event.prompt, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
     lastPromptText = userText;
     lastContextHistory = undefined;
-    const isSubagent = inheritedParent?.source === "subagent";
-    traceAttributes = externalTrace
+    // A parent turn in this process wins over the env handoff, which a
+    // sibling subagent may have overwritten.
+    const parentSession = ctx.sessionManager.getHeader()?.parentSession;
+    const effectiveParent = (parentSession && lookupInProcessParent(parentSession)) || inheritedParent;
+    const turnExternalTrace = effectiveParent?.externalTrace ?? false;
+
+    const isSubagent = effectiveParent?.source === "subagent";
+    traceAttributes = turnExternalTrace
       ? {}
       : {
           ...(isSubagent ? {} : { [LangfuseOtelSpanAttributes.TRACE_NAME]: TRACE_NAME }),
           [LangfuseOtelSpanAttributes.TRACE_SESSION_ID]: isSubagent
-            ? (inheritedParent!.sessionId ?? sessionId)
+            ? (effectiveParent!.sessionId ?? sessionId)
             : sessionId,
           [LangfuseOtelSpanAttributes.TRACE_TAGS]: BASE_TAGS,
           ...(config.userId ? { [LangfuseOtelSpanAttributes.TRACE_USER_ID]: config.userId } : {}),
         };
 
+    bindProvider(rt);
     const root = startObservation(
       isSubagent ? SUBAGENT_ROOT_OBSERVATION_NAME : ROOT_OBSERVATION_NAME,
       {
@@ -872,16 +928,17 @@ export default function (pi: ExtensionAPI) {
           ...(gitBranch ? { git_branch: gitBranch } : {}),
           ...(ctx.model ? { model: ctx.model.id, provider: ctx.model.provider } : {}),
           ...(isSubagent
-            ? { pi_subagent: true, subagent_depth: inheritedParent!.depth, parent_session_id: inheritedParent!.sessionId }
+            ? { pi_subagent: true, subagent_depth: effectiveParent!.depth, parent_session_id: effectiveParent!.sessionId }
             : {}),
           ...(isAttached ? { attached_to_external_parent: true } : {}),
         },
       },
-      { asType: "span", ...(inheritedParent ? { parentSpanContext: inheritedParent.spanContext } : {}) },
+      { asType: "span", ...(effectiveParent ? { parentSpanContext: effectiveParent.spanContext } : {}) },
     );
 
     state = {
       root,
+      registryKeys: [sessionId, ...(sessionFile ? [sessionFile] : [])],
       turnNumber,
       generationCount: 0,
       openTools: new Map(),
@@ -890,7 +947,14 @@ export default function (pi: ExtensionAPI) {
       userText,
       turnImages: [...promptImages],
     };
-    publishParentContext(root, sessionId);
+    publishParentContext(root, sessionId, effectiveParent?.depth ?? 0, turnExternalTrace);
+    const parentEntry: InProcessParent = {
+      root,
+      sessionId,
+      depth: effectiveParent?.depth ?? 0,
+      externalTrace: turnExternalTrace,
+    };
+    for (const key of state.registryKeys) IN_PROCESS_PARENTS.set(key, parentEntry);
     debug("root created, turn", turnNumber);
   });
 
@@ -932,6 +996,7 @@ export default function (pi: ExtensionAPI) {
         ? baseInput
         : undefined;
 
+    bindProvider(ensureRuntime());
     const obs = state.root.startObservation(
       GENERATION_PREFIX,
       {
@@ -1034,6 +1099,7 @@ export default function (pi: ExtensionAPI) {
         (uri) => `[data uri ~${Math.floor((uri.length * 3) / 4 / 1024)}KB]`,
       );
     }
+    bindProvider(ensureRuntime());
     const obs = state.root.startObservation(
       `${TOOL_PREFIX} ${event.toolName}`,
       {
@@ -1061,6 +1127,7 @@ export default function (pi: ExtensionAPI) {
     state.turnImages.push(...images);
 
     if (result?.usage) {
+      bindProvider(ensureRuntime());
       const usageObs = startObservation(
         TOOL_USAGE_OBSERVATION_NAME,
         {
@@ -1118,6 +1185,7 @@ export default function (pi: ExtensionAPI) {
     startedAt?: Date,
   ): void => {
     if (state) {
+      bindProvider(ensureRuntime());
       const obs = startObservation(name, attributes, {
         asType: "generation",
         parentSpanContext: state.root.otelSpan.spanContext(),
@@ -1128,8 +1196,8 @@ export default function (pi: ExtensionAPI) {
     }
     // ensureRuntime is otherwise only called in before_agent_start; an idle
     // /compact in a fresh process would hit the unset tracer provider.
-    ensureRuntime();
     const sessionId = ctx.sessionManager.getSessionId();
+    bindProvider(ensureRuntime());
     traceAttributes = externalTrace
       ? {}
       : {

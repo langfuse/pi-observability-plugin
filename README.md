@@ -26,8 +26,9 @@ Langfuse as its own trace:
   when the call fails.
 - **Images**: images you add to a prompt are uploaded as Langfuse media and
   render inside the trace.
-- **Subagents**: Pi processes spawned by other extensions nest under the turn
-  that started them.
+- **Subagents**: Pi processes spawned by other extensions, and subagent
+  sessions they run inside the same Pi process, nest under the turn that
+  started them.
 
 ## Prerequisites
 
