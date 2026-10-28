@@ -118,6 +118,8 @@ export interface LangfuseConfig {
   userId?: string;
   environment?: string;
   release?: string;
+  /** Enable agent_end fallback for Pi forks without agent_settled (e.g. Prime Agent). */
+  finalizeOnAgentEnd?: boolean;
 }
 
 export function loadConfig(): LangfuseConfig | undefined {
@@ -144,6 +146,7 @@ export function loadConfig(): LangfuseConfig | undefined {
     userId: process.env.LANGFUSE_USER_ID?.trim() || asTrimmedString(file.userId),
     environment: process.env.LANGFUSE_TRACING_ENVIRONMENT?.trim() || asTrimmedString(file.environment),
     release: process.env.LANGFUSE_RELEASE?.trim() || asTrimmedString(file.release),
+    finalizeOnAgentEnd: file.finalizeOnAgentEnd === true,
   };
 }
 
@@ -1224,12 +1227,24 @@ export default function (pi: ExtensionAPI) {
     debug("branch summary traced", usage?.input, usage?.output, usage?.cost?.total);
   });
 
-  pi.on("agent_settled", async (_event, ctx) => {
+  const finishTurn = async (ctx: ExtensionContext) => {
     if (!state) return;
     finalizeRoot({ cancelled: false });
     await flush();
     if (ctx.hasUI) ctx.ui.setStatus("langfuse", "langfuse ✓ (trace sent)");
+  };
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    await finishTurn(ctx);
   });
+
+  // Prime Agent emits agent_end but not agent_settled. The opt-in fallback
+  // avoids finalizing ordinary Pi turns before they have fully settled.
+  if (config.finalizeOnAgentEnd) {
+    pi.on("agent_end", async (_event, ctx) => {
+      await finishTurn(ctx);
+    });
+  }
 
   pi.on("session_shutdown", async (event) => {
     if (state) finalizeRoot({ cancelled: true });

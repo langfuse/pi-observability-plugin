@@ -99,4 +99,27 @@ describe("loadConfig", () => {
     assert.equal(config?.userId, undefined);
     assert.equal(config?.environment, undefined);
   });
+
+  it("keeps the agent_end fallback disabled by default", () => {
+    writeConfigFile({ publicKey: "pk-lf-file", secretKey: "sk-lf-file" });
+    assert.equal(loadConfig()?.finalizeOnAgentEnd, false);
+  });
+
+  it("enables the fallback for a Prime Agent config", () => {
+    writeConfigFile({
+      publicKey: "pk-lf-file",
+      secretKey: "sk-lf-file",
+      finalizeOnAgentEnd: true,
+    });
+    assert.equal(loadConfig()?.finalizeOnAgentEnd, true);
+  });
+
+  it("does not enable the fallback for non-boolean settings", () => {
+    writeConfigFile({
+      publicKey: "pk-lf-file",
+      secretKey: "sk-lf-file",
+      finalizeOnAgentEnd: "true",
+    });
+    assert.equal(loadConfig()?.finalizeOnAgentEnd, false);
+  });
 });

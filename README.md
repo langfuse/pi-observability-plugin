@@ -78,6 +78,15 @@ export LANGFUSE_USER_ID="your-user-id"
 Environment variables take precedence over the config file, so you can override
 a single value without editing the file.
 
+### Prime Agent compatibility
+
+Prime Agent emits `agent_end` rather than Pi's `agent_settled` event. If you
+use this plugin with Prime Agent, add `"finalizeOnAgentEnd": true` to your
+`langfuse.json` to close and flush traces at the end of each turn.
+
+Leave this setting unset for standard Pi: by default, the plugin continues
+to finalize on `agent_settled` to avoid ending traces prematurely.
+
 ## Environment variables
 
 | Variable                       | Description                                                                                                                                       | Required            |
