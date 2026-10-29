@@ -656,7 +656,7 @@ interface OpenGeneration {
 
 interface PromptState {
   root: LangfuseSpan;
-  turnNumber: number;
+  turnNumber?: number;
   generationCount: number;
   openGeneration?: OpenGeneration;
   openTools: Map<string, { obs: LangfuseTool; name: string; startedAt: Date }>;
@@ -841,9 +841,19 @@ export default function (pi: ExtensionAPI) {
     if (state) finalizeRoot({ cancelled: true });
 
     const sessionId = ctx.sessionManager.getSessionId();
-    const turnNumber = resolveTurnNumber(ctx, event.prompt);
-    const promptImages = extractImages(event.images);
-    const userText = [event.prompt, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
+    // Since pi 1.2 this event is a union on messageType: a run that
+    // sendMessage(..., { triggerTurn: true }) started while idle arrives as
+    // "custom", carrying the starting message instead of a prompt. The
+    // devDependency types predate the union, hence the narrow cast.
+    const startEvent = event as { messageType?: string; message?: { content?: unknown } };
+    const customMessage = startEvent.messageType === "custom" ? startEvent.message : undefined;
+    const turnNumber = customMessage ? undefined : resolveTurnNumber(ctx, event.prompt);
+    const promptImages = customMessage
+      ? extractImages(customMessage.content)
+      : extractImages(event.images);
+    const userText = customMessage
+      ? renderContentWithImageMarkers(customMessage.content)
+      : [event.prompt, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
     lastPromptText = userText;
     lastContextHistory = undefined;
     const isSubagent = inheritedParent?.source === "subagent";
@@ -867,7 +877,8 @@ export default function (pi: ExtensionAPI) {
           extension: EXTENSION_NAME,
           extension_version: EXTENSION_VERSION,
           session_id: sessionId,
-          turn_number: turnNumber,
+          ...(turnNumber !== undefined ? { turn_number: turnNumber } : {}),
+          ...(customMessage ? { triggered_by: "custom_message" } : {}),
           cwd: ctx.cwd,
           ...(gitBranch ? { git_branch: gitBranch } : {}),
           ...(ctx.model ? { model: ctx.model.id, provider: ctx.model.provider } : {}),
@@ -891,7 +902,7 @@ export default function (pi: ExtensionAPI) {
       turnImages: [...promptImages],
     };
     publishParentContext(root, sessionId);
-    debug("root created, turn", turnNumber);
+    debug("root created, turn", turnNumber ?? "custom message");
   });
 
   pi.on("context", (event) => {

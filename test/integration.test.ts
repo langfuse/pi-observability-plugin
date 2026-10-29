@@ -5,6 +5,7 @@
  * session grouping and turn numbering.
  */
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -23,6 +24,23 @@ import {
   THINK_ONLY_REASONING,
   waitForRequests,
 } from "./helpers.ts";
+import { TRIGGER_TEXT } from "./fixtures/trigger-turn.ts";
+
+// The suite selects pi through PI_BIN the same way as helpers.ts. A run that
+// sendMessage(..., { triggerTurn: true }) started while idle fires
+// before_agent_start only on pi 1.2+ (#50); older pi is #51's scope.
+const PI_BIN = process.env.PI_BIN || join(REPO_ROOT, "node_modules", ".bin", "pi");
+const PI_VERSION = (() => {
+  try {
+    return execFileSync(PI_BIN, ["--version"], { encoding: "utf8" }).trim();
+  } catch {
+    return "";
+  }
+})();
+const PI_SUPPORTS_CUSTOM_START = (() => {
+  const [major = 0, minor = 0] = PI_VERSION.split(".").map(Number);
+  return major > 1 || (major === 1 && minor >= 2);
+})();
 
 function buildLangfuseEnv(capture: Capture): Record<string, string> {
   return {
@@ -235,6 +253,76 @@ describe("integration: pi -> extension -> Langfuse export", () => {
         t1!.attrs["langfuse.trace.name"],
         t2!.attrs["langfuse.trace.name"],
         "trace name is constant so Langfuse name-based grouping works",
+      );
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("traces the run a sendMessage({ triggerTurn: true }) started while idle", async (t) => {
+    if (!PI_SUPPORTS_CUSTOM_START) {
+      t.skip(
+        `pi ${PI_VERSION || "(unknown version)"} predates the 1.2 before_agent_start union, so the triggered run fires no before_agent_start there (#50, #51)`,
+      );
+      return;
+    }
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const env = buildLangfuseEnv(capture);
+      const result = await runPi(sandbox, "Explore this project and summarize it", {
+        env,
+        extensions: [join(REPO_ROOT, "test", "fixtures", "trigger-turn.ts")],
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+
+      // A following user prompt in the same session proves the custom run did
+      // not consume a turn number.
+      const followUp = await runPi(sandbox, "And what should we do next?", { env, continue: true });
+      assert.equal(followUp.status, 0, `pi failed: ${followUp.stderr}`);
+
+      const deadline = Date.now() + 15_000;
+      while (findSpansByName(capture.spans(), "Conversational Turn").length < 3 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const roots = byStart(findSpansByName(capture.spans(), "Conversational Turn"));
+      assert.equal(roots.length, 3, "prompt, triggered run and follow-up prompt each get a root");
+      const [prompted, triggered, followedUp] = roots as [CapturedSpan, CapturedSpan, CapturedSpan];
+
+      assert.equal(triggered.parentSpanId, undefined);
+      assert.equal(triggered.attrs["langfuse.trace.name"], "Pi Turn");
+      assert.equal(triggered.attrs["session.id"], prompted.attrs["session.id"], "same pi session");
+      assert.equal(triggered.attrs["langfuse.observation.metadata.triggered_by"], "custom_message");
+      assert.deepEqual(inputOf(triggered), [{ role: "user", content: TRIGGER_TEXT }]);
+      assert.equal(
+        triggered.attrs["langfuse.observation.metadata.turn_number"],
+        undefined,
+        "a triggered run is not a user turn and must not take a turn number",
+      );
+
+      // The triggered run's generations nest under its root, not under the
+      // turn before it.
+      const tree = capture.spans().filter((s) => s.traceId === triggered.traceId);
+      const generations = findSpansByName(tree, "LLM Call");
+      assert.ok(generations.length >= 1, "the triggered run's model calls must be traced");
+      for (const generation of generations) {
+        assert.equal(
+          generation.parentSpanId,
+          triggered.spanId,
+          `${generation.name} must be a child of the triggered root`,
+        );
+      }
+
+      assert.equal(Number(prompted.attrs["langfuse.observation.metadata.turn_number"]), 1);
+      assert.equal(
+        Number(followedUp.attrs["langfuse.observation.metadata.turn_number"]),
+        2,
+        "the next user prompt keeps the turn number the custom run must not have consumed",
+      );
+      assert.equal(
+        followedUp.attrs["session.id"],
+        prompted.attrs["session.id"],
+        "the follow-up prompt continues the same pi session",
       );
     } finally {
       capture.close();
