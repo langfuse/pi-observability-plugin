@@ -416,17 +416,20 @@ export function runPi(
     continue?: boolean;
     env?: Record<string, string | undefined>;
     extensions?: string[];
+    provider?: string;
+    model?: string;
+    apiKey?: string;
   } = {},
 ): Promise<{ status: number | null; stdout: string; stderr: string }> {
   const args = ["-e", EXTENSION];
   for (const extra of opts.extensions ?? []) args.push("-e", extra);
   args.push(
     "--provider",
-    "mock",
+    opts.provider ?? "mock",
     "--model",
-    "mock-gpt-1",
+    opts.model ?? "mock-gpt-1",
     "--api-key",
-    "mock-key",
+    opts.apiKey ?? "mock-key",
     "--no-context-files",
   );
   if (opts.continue) args.push("-c");

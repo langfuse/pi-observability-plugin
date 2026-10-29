@@ -23,6 +23,12 @@ import {
   THINK_ONLY_REASONING,
   waitForRequests,
 } from "./helpers.ts";
+import {
+  CUSTOM_MODEL,
+  CUSTOM_PROVIDER,
+  CUSTOM_REPLY,
+  CUSTOM_USAGE,
+} from "./fixtures/custom-provider.ts";
 
 function buildLangfuseEnv(capture: Capture): Record<string, string> {
   return {
@@ -206,6 +212,59 @@ describe("integration: pi -> extension -> Langfuse export", () => {
           `${span.name} must carry the trace name`,
         );
       }
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("traces a provider that streams without calling onPayload", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const result = await runPi(sandbox, "Reply with exactly: ok", {
+        env: buildLangfuseEnv(capture),
+        provider: CUSTOM_PROVIDER,
+        model: CUSTOM_MODEL,
+        apiKey: "unused",
+        extensions: [join(REPO_ROOT, "test", "fixtures", "custom-provider.ts")],
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+      await waitForRequests(capture, 1);
+      const spans = capture.spans();
+
+      const roots = findSpansByName(spans, "Conversational Turn");
+      assert.equal(roots.length, 1);
+      const root = roots[0]!;
+      assert.deepEqual(outputOf(root), { role: "assistant", content: CUSTOM_REPLY });
+
+      const generations = findSpansByName(spans, "LLM Call");
+      assert.equal(generations.length, 1);
+      const generation = generations[0]!;
+      assert.equal(generation.parentSpanId, root.spanId);
+      assert.equal(generation.attrs["langfuse.observation.type"], "generation");
+      assert.equal(generation.attrs["langfuse.observation.model.name"], CUSTOM_MODEL);
+      assert.deepEqual(outputOf(generation), { role: "assistant", content: CUSTOM_REPLY });
+      const tracedInput = historyOf(generation);
+      assert.deepEqual(tracedInput, [{ role: "user", content: "Reply with exactly: ok" }]);
+      assert.deepEqual(
+        JSON.parse(String(generation.attrs["langfuse.observation.usage_details"])) as Record<string, number>,
+        {
+          input: CUSTOM_USAGE.input,
+          output: CUSTOM_USAGE.output,
+          cache_read_input_tokens: CUSTOM_USAGE.cacheRead,
+          cache_creation_input_tokens: CUSTOM_USAGE.cacheWrite,
+        },
+      );
+      assert.deepEqual(
+        JSON.parse(String(generation.attrs["langfuse.observation.cost_details"])) as Record<string, number>,
+        {
+          total: CUSTOM_USAGE.cost.total,
+          input: CUSTOM_USAGE.cost.input,
+          output: CUSTOM_USAGE.cost.output,
+          cache_read_input_tokens: CUSTOM_USAGE.cost.cacheRead,
+          cache_creation_input_tokens: CUSTOM_USAGE.cost.cacheWrite,
+        },
+      );
     } finally {
       capture.close();
     }

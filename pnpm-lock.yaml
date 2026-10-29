@@ -27,6 +27,9 @@ importers:
         specifier: ^2.10.0
         version: 2.10.0(@opentelemetry/api@1.9.1)
     devDependencies:
+      '@earendil-works/pi-ai':
+        specifier: 0.84.3
+        version: 0.84.3(ws@8.21.3)
       '@earendil-works/pi-coding-agent':
         specifier: ^0.84.2
         version: 0.84.3(ws@8.21.3)

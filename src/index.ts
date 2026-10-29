@@ -910,7 +910,7 @@ export default function (pi: ExtensionAPI) {
     debug("system prompt captured", systemPrompt.length);
   });
 
-  pi.on("before_provider_request", (event, ctx) => {
+  const startGeneration = (ctx: ExtensionContext, payload?: unknown): void => {
     if (!state) return;
     if (state.openGeneration && !state.openGeneration.finished) {
       const gen = state.openGeneration;
@@ -937,7 +937,7 @@ export default function (pi: ExtensionAPI) {
       {
         input: attachToolDefinitions(generationInput, activeToolDefinitions(pi)),
         model: ctx.model?.id,
-        modelParameters: extractModelParameters(event.payload, ctx.model, ctx.thinkingLevel),
+        modelParameters: extractModelParameters(payload, ctx.model, ctx.thinkingLevel),
         metadata: {
           assistant_index: index - 1,
           input_source: history ? "context" : "delta",
@@ -948,6 +948,20 @@ export default function (pi: ExtensionAPI) {
       { asType: "generation" },
     );
     state.openGeneration = { obs, index, sawFirstToken: false, finished: false };
+  };
+
+  pi.on("before_provider_request", (event, ctx) => {
+    startGeneration(ctx, event.payload);
+  });
+
+  pi.on("message_start", (event, ctx) => {
+    if (!state) return;
+    if (state.openGeneration && !state.openGeneration.finished) return;
+    // Providers with a custom streamSimple never call onPayload, so pi emits no
+    // before_provider_request. Fall back to the assistant message start, which
+    // fires for every provider, and open the generation there.
+    if ((event.message as { role?: string })?.role !== "assistant") return;
+    startGeneration(ctx);
   });
 
   pi.on("message_update", (event) => {
