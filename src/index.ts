@@ -662,7 +662,10 @@ interface PromptState {
   openTools: Map<string, { obs: LangfuseTool; name: string; startedAt: Date }>;
   pendingToolResults: Array<{ tool_call_id: string; name: string; content: string }>;
   lastAssistantText?: string;
-  sawError: boolean;
+  // A failed model call fails the turn; a failed tool call does not, since
+  // agents usually recover from it, so it is only counted.
+  modelError?: string;
+  toolErrorCount: number;
   userText: string;
   turnImages: PiImagePart[];
   systemPrompt?: string;
@@ -782,8 +785,16 @@ export default function (pi: ExtensionAPI) {
     state.root.update({
       input: media.length ? { role: "user", content: toMultimodalContent(state.userText, media) } : undefined,
       output: state.lastAssistantText ? { role: "assistant", content: state.lastAssistantText } : undefined,
-      level: state.sawError ? "ERROR" : undefined,
+      ...(state.modelError !== undefined
+        ? { level: "ERROR" as const, statusMessage: state.modelError }
+        : state.toolErrorCount
+          ? {
+              level: "WARNING" as const,
+              statusMessage: `${state.toolErrorCount} tool call${state.toolErrorCount === 1 ? "" : "s"} failed`,
+            }
+          : {}),
       metadata: {
+        ...(state.toolErrorCount ? { tool_error_count: state.toolErrorCount } : {}),
         ...(state.turnImages.length ? { image_count: state.turnImages.length } : {}),
         ...(opts.cancelled ? { cancelled: true } : {}),
       },
@@ -886,7 +897,7 @@ export default function (pi: ExtensionAPI) {
       generationCount: 0,
       openTools: new Map(),
       pendingToolResults: [],
-      sawError: false,
+      toolErrorCount: 0,
       userText,
       turnImages: [...promptImages],
     };
@@ -986,7 +997,7 @@ export default function (pi: ExtensionAPI) {
     const tools = extractToolCalls(message.content);
     const thinking = extractThinking(message.content);
     const isError = message.stopReason === "error" || message.stopReason === "aborted";
-    if (message.stopReason === "error") state.sawError = true;
+    if (message.stopReason === "error") state.modelError = message.errorMessage || "stopReason: error";
 
     gen.obs.update({
       output: {
@@ -1057,7 +1068,7 @@ export default function (pi: ExtensionAPI) {
     const result = event.result as { content?: unknown; usage?: PiUsage } | undefined;
     const images = extractImages(result?.content);
     const rawOutput = renderContentWithImageMarkers(result?.content) || safeStringify(result?.content);
-    if (event.isError) state.sawError = true;
+    if (event.isError) state.toolErrorCount += 1;
     state.turnImages.push(...images);
 
     if (result?.usage) {
