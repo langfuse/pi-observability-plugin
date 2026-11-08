@@ -4,7 +4,8 @@
  * - startMockProvider(): OpenAI-compatible chat/completions server with a
  *   deterministic 3-stage script (bash ls → read README.md → final answer,
  *   realistic usage incl. cache tokens). Prompts containing "[fail]" run a
- *   failing command first, so error paths can be asserted.
+ *   failing command first, so error paths can be asserted; "[model-error]"
+ *   makes the model request itself fail.
  * - startCaptureServer(): fake Langfuse ingest that records every request.
  * - runPi(): spawns the real pi CLI (devDependency) in a throwaway sandbox
  *   (PI_CODING_AGENT_DIR = temp dir), loading the extension via `-e`.
@@ -127,6 +128,11 @@ export function startMockProvider(): Promise<MockProvider> {
       const failMode = JSON.stringify(lastUser?.content ?? "").includes("[fail]");
       const toolOnlyMode = JSON.stringify(lastUser?.content ?? "").includes("[tool-only]");
       const thinkOnlyMode = JSON.stringify(lastUser?.content ?? "").includes("[think-only]");
+      if (JSON.stringify(lastUser?.content ?? "").includes("[model-error]")) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "mock: invalid request", type: "invalid_request_error" } }));
+        return;
+      }
       // True only when a test loads the subagent fixture. The default script
       // does not change for the other tests.
       const canDelegate = (payload.tools ?? []).some((t) => t.function?.name === "subagent");

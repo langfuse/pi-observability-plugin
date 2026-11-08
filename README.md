@@ -23,7 +23,8 @@ Langfuse as its own trace:
 - **Conversation history**: each generation has all messages of that call.
 - **Reasoning**: each thinking block is on the step that made it.
 - **Tool calls**: each tool Pi invokes, with input, output, and an `ERROR` level
-  when the call fails.
+  when the call fails. The turn is marked `WARNING` with the number of failed
+  calls; only a failed model call marks the turn `ERROR`.
 - **Images**: images you add to a prompt are uploaded as Langfuse media and
   render inside the trace.
 - **Subagents**: Pi processes spawned by other extensions nest under the turn

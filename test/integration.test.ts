@@ -241,7 +241,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
     }
   });
 
-  it("marks failed tools and the root with ERROR level", async () => {
+  it("marks failed tools ERROR and counts them on the root as a WARNING", async () => {
     const capture = await startCaptureServer();
     try {
       const sandbox = createSandbox(mock.port);
@@ -256,7 +256,31 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       assert.equal(String(tool!.attrs["langfuse.observation.metadata.is_error"]), "true");
 
       const root = findSpansByName(spans, "Conversational Turn")[0];
-      assert.equal(root!.attrs["langfuse.observation.level"], "ERROR", "root reflects that the turn saw an error");
+      assert.equal(
+        root!.attrs["langfuse.observation.level"],
+        "WARNING",
+        "a failed tool call does not fail the turn: the agent can recover from it",
+      );
+      assert.equal(root!.attrs["langfuse.observation.status_message"], "1 tool call failed");
+      assert.equal(Number(root!.attrs["langfuse.observation.metadata.tool_error_count"]), 1);
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("marks the root ERROR when the model call fails", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      await runPi(sandbox, "[model-error] say hi", { env: buildLangfuseEnv(capture) });
+      await waitForRequests(capture, 1);
+      const spans = capture.spans();
+
+      const root = findSpansByName(spans, "Conversational Turn")[0];
+      assert.ok(root, "the turn must be traced");
+      assert.equal(root!.attrs["langfuse.observation.level"], "ERROR");
+      assert.match(String(root!.attrs["langfuse.observation.status_message"]), /invalid request|400/);
+      assert.equal(root!.attrs["langfuse.observation.metadata.tool_error_count"], undefined);
     } finally {
       capture.close();
     }
