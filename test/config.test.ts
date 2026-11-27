@@ -52,6 +52,28 @@ describe("loadConfig", () => {
     assert.equal(config?.baseUrl, "https://cloud.langfuse.com");
   });
 
+  it("keeps the pi tag when no custom tags are configured", () => {
+    writeConfigFile({ publicKey: "pk-lf-file", secretKey: "sk-lf-file" });
+    assert.deepEqual(loadConfig()?.tags, ["pi"]);
+  });
+
+  it("normalizes custom tags while preserving the pi tag", () => {
+    const longestTag = "x".repeat(200);
+    writeConfigFile({
+      publicKey: "pk-lf-file",
+      secretKey: "sk-lf-file",
+      tags: [" device:laptop ", "pi", "device:laptop", "", "  ", 42, null, "x".repeat(201), longestTag],
+    });
+    assert.deepEqual(loadConfig()?.tags, ["pi", "device:laptop", longestTag]);
+  });
+
+  it("ignores a non-array tags value", () => {
+    for (const tags of ["device:laptop", null, 42, {}]) {
+      writeConfigFile({ publicKey: "pk-lf-file", secretKey: "sk-lf-file", tags });
+      assert.deepEqual(loadConfig()?.tags, ["pi"]);
+    }
+  });
+
   it("reads keys from the config file", () => {
     writeConfigFile({ publicKey: "pk-lf-file", secretKey: "sk-lf-file", baseUrl: "https://eu.example.com/", userId: "u1" });
     const config = loadConfig();

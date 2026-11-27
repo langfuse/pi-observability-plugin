@@ -118,6 +118,7 @@ export interface LangfuseConfig {
   userId?: string;
   environment?: string;
   release?: string;
+  tags?: string[];
 }
 
 export function loadConfig(): LangfuseConfig | undefined {
@@ -137,6 +138,12 @@ export function loadConfig(): LangfuseConfig | undefined {
     process.env.LANGFUSE_HOST?.trim() ||
     asTrimmedString(file.baseUrl) ||
     "https://cloud.langfuse.com";
+  const tags = Array.isArray(file.tags)
+    ? file.tags
+        .filter((tag): tag is string => typeof tag === "string")
+        .map((tag) => tag.trim())
+        .filter((tag) => tag.length > 0 && tag.length <= 200)
+    : [];
   return {
     publicKey,
     secretKey,
@@ -144,6 +151,7 @@ export function loadConfig(): LangfuseConfig | undefined {
     userId: process.env.LANGFUSE_USER_ID?.trim() || asTrimmedString(file.userId),
     environment: process.env.LANGFUSE_TRACING_ENVIRONMENT?.trim() || asTrimmedString(file.environment),
     release: process.env.LANGFUSE_RELEASE?.trim() || asTrimmedString(file.release),
+    tags: [...new Set([...BASE_TAGS, ...tags])],
   };
 }
 
@@ -854,7 +862,7 @@ export default function (pi: ExtensionAPI) {
           [LangfuseOtelSpanAttributes.TRACE_SESSION_ID]: isSubagent
             ? (inheritedParent!.sessionId ?? sessionId)
             : sessionId,
-          [LangfuseOtelSpanAttributes.TRACE_TAGS]: BASE_TAGS,
+          [LangfuseOtelSpanAttributes.TRACE_TAGS]: config.tags ?? BASE_TAGS,
           ...(config.userId ? { [LangfuseOtelSpanAttributes.TRACE_USER_ID]: config.userId } : {}),
         };
 
@@ -1135,7 +1143,7 @@ export default function (pi: ExtensionAPI) {
       : {
           ...(inheritedParent ? {} : { [LangfuseOtelSpanAttributes.TRACE_NAME]: `Pi ${name}` }),
           [LangfuseOtelSpanAttributes.TRACE_SESSION_ID]: inheritedParent?.sessionId ?? sessionId,
-          [LangfuseOtelSpanAttributes.TRACE_TAGS]: BASE_TAGS,
+          [LangfuseOtelSpanAttributes.TRACE_TAGS]: config.tags ?? BASE_TAGS,
           ...(config.userId ? { [LangfuseOtelSpanAttributes.TRACE_USER_ID]: config.userId } : {}),
         };
     const obs = startObservation(

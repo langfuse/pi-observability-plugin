@@ -56,7 +56,8 @@ Create a credentials file at `~/.pi/agent/langfuse.json`:
   "secretKey": "sk-lf-...",
   "baseUrl": "https://cloud.langfuse.com",
   "userId": "your-user-id",
-  "environment": "development"
+  "environment": "development",
+  "tags": ["device:laptop"]
 }
 ```
 
@@ -64,6 +65,11 @@ Only `publicKey` and `secretKey` are required. If `baseUrl` is omitted, the
 plugin uses `https://cloud.langfuse.com` (EU region). `userId`, `environment`
 and `release` are optional labels that let you segment traces by teammate, stage
 or version. Keep the file private, because it holds a secret key.
+
+Optional `tags` let you filter traces by device or other custom labels. The
+plugin always includes the `pi` tag, trims whitespace and removes duplicates.
+Non-string, empty and longer-than-200-character tags are ignored. Tags are
+configured in `langfuse.json`; there is no environment variable for them.
 
 Alternatively, set your credentials with environment variables:
 
